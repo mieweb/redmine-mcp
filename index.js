@@ -65,6 +65,23 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 	return json;
 }
 
+async function redmineDownload(absoluteUrl) {
+	if (!REDMINE_API_KEY) throw new Error("REDMINE_API_KEY is not configured");
+	const res = await fetch(absoluteUrl, {
+		headers: { "X-Redmine-API-Key": REDMINE_API_KEY },
+	});
+	if (!res.ok) {
+		throw new Error(
+			`Redmine download ${absoluteUrl} failed: ${res.status} ${res.statusText}`
+		);
+	}
+	const mimeType =
+		res.headers.get("content-type")?.split(";")[0]?.trim() ||
+		"application/octet-stream";
+	const buf = Buffer.from(await res.arrayBuffer());
+	return { mimeType, buffer: buf };
+}
+
 function ok(data) {
 	return {
 		content: [
@@ -269,6 +286,38 @@ const TOOLS = [
 			},
 		},
 	},
+	{
+		name: "redmine_list_issue_attachments",
+		description:
+			"List attachments on an issue (id, filename, content_type, filesize, content_url). Use redmine_get_attachment to download one.",
+		inputSchema: {
+			type: "object",
+			required: ["issue_id"],
+			properties: {
+				issue_id: { type: "integer" },
+			},
+		},
+	},
+	{
+		name: "redmine_get_attachment",
+		description:
+			"Download a Redmine attachment by id. Images (png/jpeg/gif/webp) are returned as MCP image content so the model can view them directly. Other file types are returned as base64 plus metadata. Optionally write the raw bytes to a local path via save_to.",
+		inputSchema: {
+			type: "object",
+			required: ["id"],
+			properties: {
+				id: { type: "integer", description: "Attachment id (from redmine_list_issue_attachments or redmine_get_issue)" },
+				save_to: {
+					type: "string",
+					description: "Optional absolute or relative filesystem path to also write the raw bytes to.",
+				},
+				max_bytes: {
+					type: "integer",
+					description: "Refuse to inline attachments larger than this (default 10485760 = 10 MiB). save_to still works.",
+				},
+			},
+		},
+	},
 ];
 
 async function handleTool(name, args) {
@@ -337,6 +386,76 @@ async function handleTool(name, args) {
 					body: { time_entry: args },
 				})
 			);
+
+		case "redmine_list_issue_attachments": {
+			const data = await redmineRequest(`/issues/${args.issue_id}.json`, {
+				query: { include: "attachments" },
+			});
+			const atts = (data?.issue?.attachments || []).map((a) => ({
+				id: a.id,
+				filename: a.filename,
+				content_type: a.content_type,
+				filesize: a.filesize,
+				description: a.description,
+				author: a.author,
+				created_on: a.created_on,
+				content_url: a.content_url,
+			}));
+			return ok({ issue_id: args.issue_id, count: atts.length, attachments: atts });
+		}
+
+		case "redmine_get_attachment": {
+			const meta = await redmineRequest(`/attachments/${args.id}.json`);
+			const att = meta?.attachment;
+			if (!att) throw new Error(`Attachment ${args.id} not found`);
+			const maxBytes = Number.isFinite(args.max_bytes)
+				? Number(args.max_bytes)
+				: 10 * 1024 * 1024;
+			const { mimeType, buffer } = await redmineDownload(att.content_url);
+
+			if (args.save_to) {
+				const fs = await import("node:fs/promises");
+				const path = await import("node:path");
+				const dest = path.resolve(String(args.save_to));
+				await fs.mkdir(path.dirname(dest), { recursive: true });
+				await fs.writeFile(dest, buffer);
+				att.saved_to = dest;
+			}
+
+			const info = {
+				id: att.id,
+				filename: att.filename,
+				content_type: att.content_type || mimeType,
+				filesize: att.filesize ?? buffer.length,
+				description: att.description,
+				author: att.author,
+				created_on: att.created_on,
+				saved_to: att.saved_to,
+			};
+
+			const isImage = /^image\/(png|jpe?g|gif|webp)$/i.test(mimeType);
+
+			if (buffer.length > maxBytes) {
+				return ok({
+					...info,
+					note: `Attachment is ${buffer.length} bytes which exceeds max_bytes=${maxBytes}. ${args.save_to ? "Bytes were written to save_to." : "Re-call with a larger max_bytes or provide save_to."}`,
+					inlined: false,
+				});
+			}
+
+			const base64 = buffer.toString("base64");
+
+			if (isImage) {
+				return {
+					content: [
+						{ type: "text", text: JSON.stringify(info, null, 2) },
+						{ type: "image", data: base64, mimeType },
+					],
+				};
+			}
+
+			return ok({ ...info, base64, inlined: true });
+		}
 
 		default:
 			return err(`Unknown tool: ${name}`);

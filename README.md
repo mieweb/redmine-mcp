@@ -38,6 +38,8 @@ Ask your editor's AI to *"summarize Redmine #12345"*, *"list my open tickets"*, 
 | `redmine_search` | Full-text search across issues, wiki, news, documents |
 | `redmine_list_time_entries` | List time entries with filters |
 | `redmine_create_time_entry` | Log time against an issue or project |
+| `redmine_list_issue_attachments` | List attachments on an issue (id, filename, content-type, size) |
+| `redmine_get_attachment` | Download an attachment by id — **images are returned inline as MCP image content** so the model can view them; other files are returned as base64 and optionally written to disk via `save_to` |
 
 ## 🚀 Installation
 
