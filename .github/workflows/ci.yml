@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Syntax check
+        run: node --check index.js
+      - name: Smoke test (list tools over stdio)
+        env:
+          REDMINE_URL: https://example.invalid
+          REDMINE_API_KEY: dummy
+        run: |
+          node - <<'EOF'
+          import { spawn } from 'node:child_process';
+          const p = spawn('node', ['index.js'], { env: process.env });
+          let buf = '';
+          p.stdout.on('data', d => { buf += d; });
+          p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'ci',version:'1'}}}) + '\n');
+          setTimeout(() => {
+            p.stdin.write(JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/list',params:{}}) + '\n');
+          }, 200);
+          setTimeout(() => {
+            const ok = buf.split('\n').some(l => { try { const j = JSON.parse(l); return j.id === 2 && Array.isArray(j.result?.tools) && j.result.tools.length > 0; } catch { return false; } });
+            p.kill();
+            process.exit(ok ? 0 : 1);
+          }, 1500);
+          EOF

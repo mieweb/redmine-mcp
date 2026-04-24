@@ -1,0 +1,56 @@
+{
+  "name": "@mieweb/redmine-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol (MCP) server for Redmine — exposes the Redmine REST API (issues, projects, users, time entries, search) as MCP tools for any MCP-compatible client such as VS Code, Claude Desktop, or Cursor.",
+  "type": "module",
+  "bin": {
+    "redmine-mcp": "./index.js"
+  },
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "redmine",
+    "redmine-api",
+    "redmine-mcp",
+    "ai",
+    "llm",
+    "claude",
+    "copilot",
+    "vscode",
+    "cursor",
+    "agents",
+    "project-management",
+    "issue-tracker",
+    "mieweb"
+  ],
+  "author": "MIE (Medical Informatics Engineering)",
+  "license": "MIT",
+  "homepage": "https://github.com/mieweb/redmine-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/mieweb/redmine-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mieweb/redmine-mcp.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
