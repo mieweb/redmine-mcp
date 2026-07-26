@@ -159,6 +159,7 @@ All three read a similar `mcpServers` or `servers` block. Use the same config sh
 | `REDMINE_API_KEY` | ✅ | Personal or service-account API key. Treat it like a password. |
 | `REDMINE_ON_BEHALF_OF` | ⬜ | Default user to act on behalf of — a Redmine **login or email**. Requires `REDMINE_API_KEY` to be an **admin** key. Used as the fallback when a tool call doesn't pass its own `on_behalf_of`. Ignored for non-admin keys. |
 | `REDMINE_LOCK_ON_BEHALF_OF` | ⬜ | When truthy (`1`/`true`/`yes`), **locks** the identity to `REDMINE_ON_BEHALF_OF`: the per-call `on_behalf_of` argument is not advertised and is ignored, so the model cannot impersonate a different user. Use for shared-admin deployments (see Security). |
+| `REDMINE_ALLOW_ADMIN` | ⬜ | When truthy (`1`/`true`/`yes`), allows tool calls to run as the admin key owner when no impersonation identity is in effect. By default this is **fail-closed**: an admin key with no resolved identity is refused instead of silently acting with full admin privileges. |
 
 The key is sent as the `X-Redmine-API-Key` header on every request.
 
@@ -257,6 +258,15 @@ entirely on the API key and how the identity is supplied:
 
 Without the lock, treat any admin-key deployment as trusting the model with full
 administrative authority.
+
+### Fail-closed on unattributed admin access
+
+By default the server **refuses** any tool call made with an admin key when no
+impersonation identity is in effect (no lock identity, no `REDMINE_ON_BEHALF_OF`,
+and no per-call `on_behalf_of`). This prevents a misconfigured shared-admin
+deployment from silently executing actions with full admin privileges. To
+intentionally operate as the admin account itself, set `REDMINE_ALLOW_ADMIN=1`.
+Non-admin keys are unaffected.
 
 ## 🛠️ Development
 

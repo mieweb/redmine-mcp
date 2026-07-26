@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `REDMINE_LOCK_ON_BEHALF_OF` env flag to lock impersonation to `REDMINE_ON_BEHALF_OF`
   and disable the caller-supplied `on_behalf_of` argument — the recommended hardening
   for shared-admin-key deployments so a model cannot choose or drop the identity.
+- Fail-closed protection for admin keys: tool calls made with an admin key and no
+  impersonation identity are now refused by default. Set `REDMINE_ALLOW_ADMIN=1` to
+  intentionally act as the admin key owner. Non-admin keys are unaffected.
 
 ## [0.1.0] - 2026-04-24
 

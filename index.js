@@ -18,6 +18,13 @@
  *                         so a (possibly prompt-injected) model cannot impersonate a
  *                         different user. Use this for shared-admin-key deployments
  *                         that spawn one server per authenticated session.
+ *   REDMINE_ALLOW_ADMIN   (optional) When truthy ("1", "true", "yes"), allows tool
+ *                         calls to run as the admin key owner when no impersonation
+ *                         identity is in effect. By default this is FAIL-CLOSED: if
+ *                         the API key is an admin key and no identity is resolved,
+ *                         the server refuses the call instead of silently acting
+ *                         with full admin privileges. Set this only when you
+ *                         intentionally want to operate as the admin account itself.
  *
  * User impersonation ("user assertion"):
  *   Any tool accepts an optional `on_behalf_of` argument (login or email). When the
@@ -42,6 +49,9 @@ const REDMINE_ON_BEHALF_OF = (process.env.REDMINE_ON_BEHALF_OF || "").trim();
 const REDMINE_LOCK_ON_BEHALF_OF = /^(1|true|yes)$/i.test(
 	(process.env.REDMINE_LOCK_ON_BEHALF_OF || "").trim()
 );
+const REDMINE_ALLOW_ADMIN = /^(1|true|yes)$/i.test(
+	(process.env.REDMINE_ALLOW_ADMIN || "").trim()
+);
 
 if (!REDMINE_URL) {
 	console.error("[redmine-mcp] REDMINE_URL is not set");
@@ -59,6 +69,11 @@ if (REDMINE_LOCK_ON_BEHALF_OF) {
 			"[redmine-mcp] REDMINE_LOCK_ON_BEHALF_OF is set but REDMINE_ON_BEHALF_OF is empty; requests will act as the API key owner and impersonation is disabled."
 		);
 	}
+}
+if (REDMINE_ALLOW_ADMIN) {
+	console.error(
+		"[redmine-mcp] REDMINE_ALLOW_ADMIN is set; tool calls may run with full admin privileges when no impersonation identity is in effect."
+	);
 }
 
 // Carries the impersonation target (a resolved Redmine login) through the async
@@ -612,9 +627,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 			: (args.on_behalf_of ?? REDMINE_ON_BEHALF_OF) || "";
 		delete args.on_behalf_of;
 
-		if (identity && (await ensureAdmin())) {
-			const switchUser = await resolveLogin(identity);
-			return await reqCtx.run({ switchUser }, () => handleTool(name, args));
+		if (identity) {
+			if (await ensureAdmin()) {
+				const switchUser = await resolveLogin(identity);
+				return await reqCtx.run({ switchUser }, () => handleTool(name, args));
+			}
+			// Non-admin key: impersonation is a no-op, act as the key owner.
+			return await handleTool(name, args);
+		}
+
+		// No impersonation identity in effect. Fail closed if this would run as a
+		// full admin, unless explicitly opted in via REDMINE_ALLOW_ADMIN. This stops
+		// a misconfigured shared-admin-key deployment from silently executing calls
+		// with admin privileges.
+		if (!REDMINE_ALLOW_ADMIN && (await ensureAdmin())) {
+			throw new Error(
+				"Refusing to run with an admin API key and no impersonation identity. " +
+					"Set REDMINE_ON_BEHALF_OF (and REDMINE_LOCK_ON_BEHALF_OF=1 for shared " +
+					"deployments) to attribute actions to a specific user, or set " +
+					"REDMINE_ALLOW_ADMIN=1 to intentionally act as the admin key owner."
+			);
 		}
 		return await handleTool(name, args);
 	} catch (e) {
