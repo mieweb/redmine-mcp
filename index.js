@@ -6,10 +6,23 @@
  * Auth: uses the `X-Redmine-API-Key` header.
  *
  * Environment variables:
- *   REDMINE_URL     Base URL of the Redmine instance (e.g. https://redmine.example.com)
- *   REDMINE_API_KEY API key for authentication
+ *   REDMINE_URL           Base URL of the Redmine instance (e.g. https://redmine.example.com)
+ *   REDMINE_API_KEY       API key for authentication
+ *   REDMINE_ON_BEHALF_OF  (optional) Default user to act on behalf of — a Redmine
+ *                         login or email. Requires REDMINE_API_KEY to belong to an
+ *                         admin. Used as the fallback when a tool call does not pass
+ *                         its own `on_behalf_of` argument. Ignored for non-admin keys.
+ *
+ * User impersonation ("user assertion"):
+ *   Any tool accepts an optional `on_behalf_of` argument (login or email). When the
+ *   configured API key is an admin key, the request is sent with Redmine's
+ *   `X-Redmine-Switch-User` header so the action is attributed to that user. Emails
+ *   are resolved to the matching Redmine login automatically. For non-admin keys the
+ *   argument is ignored and the request behaves exactly as before (acts as the key
+ *   owner), so existing setups are unaffected.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -19,12 +32,29 @@ import {
 
 const REDMINE_URL = (process.env.REDMINE_URL || "").replace(/\/+$/, "");
 const REDMINE_API_KEY = process.env.REDMINE_API_KEY || "";
+const REDMINE_ON_BEHALF_OF = (process.env.REDMINE_ON_BEHALF_OF || "").trim();
 
 if (!REDMINE_URL) {
 	console.error("[redmine-mcp] REDMINE_URL is not set");
 }
 if (!REDMINE_API_KEY) {
 	console.error("[redmine-mcp] REDMINE_API_KEY is not set");
+}
+
+// Carries the impersonation target (a resolved Redmine login) through the async
+// call chain of a single tool invocation, so redmineRequest/redmineDownload can
+// add the X-Redmine-Switch-User header without every call site passing it.
+const reqCtx = new AsyncLocalStorage();
+
+// Build the shared auth headers, adding the impersonation header when the current
+// tool invocation has a resolved switch-user login in context.
+function authHeaders(extra) {
+	const headers = { "X-Redmine-API-Key": REDMINE_API_KEY, ...extra };
+	const switchUser = reqCtx.getStore()?.switchUser;
+	if (switchUser) {
+		headers["X-Redmine-Switch-User"] = switchUser;
+	}
+	return headers;
 }
 
 async function redmineRequest(path, { method = "GET", query, body } = {}) {
@@ -39,10 +69,7 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 		}
 	}
 
-	const headers = {
-		"X-Redmine-API-Key": REDMINE_API_KEY,
-		Accept: "application/json",
-	};
+	const headers = authHeaders({ Accept: "application/json" });
 	const init = { method, headers };
 	if (body !== undefined) {
 		headers["Content-Type"] = "application/json";
@@ -58,6 +85,12 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 		json = { raw: text };
 	}
 	if (!res.ok) {
+		const switchUser = reqCtx.getStore()?.switchUser;
+		if (res.status === 412 && switchUser) {
+			throw new Error(
+				`Redmine impersonation failed: user '${switchUser}' does not exist or is not active (X-Redmine-Switch-User returned 412).`
+			);
+		}
 		throw new Error(
 			`Redmine ${method} ${url.pathname} failed: ${res.status} ${res.statusText} - ${text.slice(0, 500)}`
 		);
@@ -68,7 +101,7 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 async function redmineDownload(absoluteUrl) {
 	if (!REDMINE_API_KEY) throw new Error("REDMINE_API_KEY is not configured");
 	const res = await fetch(absoluteUrl, {
-		headers: { "X-Redmine-API-Key": REDMINE_API_KEY },
+		headers: authHeaders(),
 	});
 	if (!res.ok) {
 		throw new Error(
@@ -95,6 +128,72 @@ function err(message) {
 		isError: true,
 		content: [{ type: "text", text: `Error: ${message}` }],
 	};
+}
+
+// ---------------------------------------------------------------------------
+// User impersonation ("user assertion") support
+// ---------------------------------------------------------------------------
+
+// Optional argument accepted by every tool: act on behalf of a Redmine user.
+const ON_BEHALF_OF_PROP = {
+	on_behalf_of: {
+		type: "string",
+		description:
+			"Act on behalf of this Redmine user (login or email). Requires an admin API key; ignored for non-admin keys. Overrides the REDMINE_ON_BEHALF_OF env default.",
+	},
+};
+
+// Lazily determine (once per process) whether the configured API key is an admin.
+// Only admin keys may impersonate or search all users, so impersonation is a no-op
+// otherwise — keeping existing non-admin setups seamless.
+let _isAdminPromise;
+async function ensureAdmin() {
+	if (!_isAdminPromise) {
+		_isAdminPromise = (async () => {
+			try {
+				const data = await redmineRequest("/users/current.json");
+				return data?.user?.admin === true;
+			} catch (e) {
+				console.error(
+					`[redmine-mcp] admin check failed, impersonation disabled: ${e?.message || e}`
+				);
+				return false;
+			}
+		})();
+	}
+	return _isAdminPromise;
+}
+
+// Cache identity (login or email) -> resolved Redmine login.
+const _loginCache = new Map();
+
+// Resolve an impersonation identity to a Redmine login. Logins are returned as-is;
+// emails are looked up via the (admin-only) users API and matched on the mail field.
+async function resolveLogin(identity) {
+	const value = String(identity).trim();
+	if (!value) return null;
+	if (_loginCache.has(value)) return _loginCache.get(value);
+
+	// Not an email -> treat as a login directly.
+	if (!value.includes("@")) {
+		_loginCache.set(value, value);
+		return value;
+	}
+
+	const data = await redmineRequest("/users.json", {
+		query: { name: value, limit: 100 },
+	});
+	const users = data?.users || [];
+	const match = users.find(
+		(u) => (u.mail || "").toLowerCase() === value.toLowerCase()
+	);
+	if (!match?.login) {
+		throw new Error(
+			`Could not resolve '${value}' to a Redmine login (no active user with that email).`
+		);
+	}
+	_loginCache.set(value, match.login);
+	return match.login;
 }
 
 const TOOLS = [
@@ -320,6 +419,15 @@ const TOOLS = [
 	},
 ];
 
+// Every tool supports optional per-call impersonation via `on_behalf_of`.
+for (const tool of TOOLS) {
+	tool.inputSchema = tool.inputSchema || { type: "object", properties: {} };
+	tool.inputSchema.properties = {
+		...tool.inputSchema.properties,
+		...ON_BEHALF_OF_PROP,
+	};
+}
+
 async function handleTool(name, args) {
 	args = args || {};
 	switch (name) {
@@ -470,8 +578,17 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-	const { name, arguments: args } = request.params;
+	const { name, arguments: rawArgs } = request.params;
+	const args = { ...(rawArgs || {}) };
 	try {
+		// Resolve optional impersonation (per-call arg overrides env default).
+		const identity = (args.on_behalf_of ?? REDMINE_ON_BEHALF_OF) || "";
+		delete args.on_behalf_of;
+
+		if (identity && (await ensureAdmin())) {
+			const switchUser = await resolveLogin(identity);
+			return await reqCtx.run({ switchUser }, () => handleTool(name, args));
+		}
 		return await handleTool(name, args);
 	} catch (e) {
 		return err(e?.message || String(e));

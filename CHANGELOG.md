@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- User impersonation ("user assertion"): every tool accepts an optional
+  `on_behalf_of` argument (Redmine login or email), and a `REDMINE_ON_BEHALF_OF`
+  env var provides a default. When the configured API key is an admin key, requests
+  are sent with the `X-Redmine-Switch-User` header so actions are attributed to the
+  target user; emails are resolved to the matching login automatically. Non-admin
+  keys ignore the argument, so existing setups are unaffected.
+
 ## [0.1.0] - 2026-04-24
 
 ### Added

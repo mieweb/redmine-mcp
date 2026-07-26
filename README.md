@@ -157,8 +157,45 @@ All three read a similar `mcpServers` or `servers` block. Use the same config sh
 | --- | :---: | --- |
 | `REDMINE_URL` | ✅ | Base URL of your Redmine instance, e.g. `https://redmine.example.com`. Trailing slashes are OK. |
 | `REDMINE_API_KEY` | ✅ | Personal or service-account API key. Treat it like a password. |
+| `REDMINE_ON_BEHALF_OF` | ⬜ | Default user to act on behalf of — a Redmine **login or email**. Requires `REDMINE_API_KEY` to be an **admin** key. Used as the fallback when a tool call doesn't pass its own `on_behalf_of`. Ignored for non-admin keys. |
 
 The key is sent as the `X-Redmine-API-Key` header on every request.
+
+### 👥 User impersonation ("user assertion")
+
+If you run a shared **admin** API key but want each action attributed to the
+actual end user, use impersonation. Every tool accepts an optional `on_behalf_of`
+argument (a Redmine **login or email**); the AI supplies the currently logged-in
+user per request. When the key is an admin key, the server resolves the value to a
+login and sends Redmine's `X-Redmine-Switch-User` header so the action is recorded
+as that user. Emails are resolved to the matching login automatically.
+
+```jsonc
+{
+  "servers": {
+    "redmine": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "github:mieweb/redmine-mcp"],
+      "env": {
+        "REDMINE_URL": "https://redmine.example.com",
+        "REDMINE_API_KEY": "an-admin-api-key"
+      }
+    }
+  }
+}
+```
+
+Then the client can call, e.g., `redmine_add_issue_note` with
+`{ "id": 12345, "notes": "…", "on_behalf_of": "jdoe@example.com" }`.
+
+This is fully backward compatible:
+
+- **Non-admin keys** (typical personal setups) ignore `on_behalf_of` entirely and
+  behave exactly as before — no configuration change needed.
+- Omitting `on_behalf_of` (and `REDMINE_ON_BEHALF_OF`) acts as the API key's own user.
+- Set `REDMINE_ON_BEHALF_OF` to impersonate a fixed user by default without
+  passing the argument on every call.
 
 ## 💡 Example prompts
 
