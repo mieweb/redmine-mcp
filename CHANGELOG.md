@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   are sent with the `X-Redmine-Switch-User` header so actions are attributed to the
   target user; emails are resolved to the matching login automatically. Non-admin
   keys ignore the argument, so existing setups are unaffected.
+- `REDMINE_LOCK_ON_BEHALF_OF` env flag to lock impersonation to `REDMINE_ON_BEHALF_OF`
+  and disable the caller-supplied `on_behalf_of` argument — the recommended hardening
+  for shared-admin-key deployments so a model cannot choose or drop the identity.
 
 ## [0.1.0] - 2026-04-24
 

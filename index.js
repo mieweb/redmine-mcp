@@ -12,6 +12,12 @@
  *                         login or email. Requires REDMINE_API_KEY to belong to an
  *                         admin. Used as the fallback when a tool call does not pass
  *                         its own `on_behalf_of` argument. Ignored for non-admin keys.
+ *   REDMINE_LOCK_ON_BEHALF_OF (optional) When truthy ("1", "true", "yes"), the
+ *                         identity is LOCKED to REDMINE_ON_BEHALF_OF: the per-call
+ *                         `on_behalf_of` argument is not advertised and is ignored,
+ *                         so a (possibly prompt-injected) model cannot impersonate a
+ *                         different user. Use this for shared-admin-key deployments
+ *                         that spawn one server per authenticated session.
  *
  * User impersonation ("user assertion"):
  *   Any tool accepts an optional `on_behalf_of` argument (login or email). When the
@@ -33,12 +39,26 @@ import {
 const REDMINE_URL = (process.env.REDMINE_URL || "").replace(/\/+$/, "");
 const REDMINE_API_KEY = process.env.REDMINE_API_KEY || "";
 const REDMINE_ON_BEHALF_OF = (process.env.REDMINE_ON_BEHALF_OF || "").trim();
+const REDMINE_LOCK_ON_BEHALF_OF = /^(1|true|yes)$/i.test(
+	(process.env.REDMINE_LOCK_ON_BEHALF_OF || "").trim()
+);
 
 if (!REDMINE_URL) {
 	console.error("[redmine-mcp] REDMINE_URL is not set");
 }
 if (!REDMINE_API_KEY) {
 	console.error("[redmine-mcp] REDMINE_API_KEY is not set");
+}
+if (REDMINE_LOCK_ON_BEHALF_OF) {
+	if (REDMINE_ON_BEHALF_OF) {
+		console.error(
+			`[redmine-mcp] Identity locked to '${REDMINE_ON_BEHALF_OF}'; per-call on_behalf_of is disabled.`
+		);
+	} else {
+		console.error(
+			"[redmine-mcp] REDMINE_LOCK_ON_BEHALF_OF is set but REDMINE_ON_BEHALF_OF is empty; requests will act as the API key owner and impersonation is disabled."
+		);
+	}
 }
 
 // Carries the impersonation target (a resolved Redmine login) through the async
@@ -419,13 +439,16 @@ const TOOLS = [
 	},
 ];
 
-// Every tool supports optional per-call impersonation via `on_behalf_of`.
-for (const tool of TOOLS) {
-	tool.inputSchema = tool.inputSchema || { type: "object", properties: {} };
-	tool.inputSchema.properties = {
-		...tool.inputSchema.properties,
-		...ON_BEHALF_OF_PROP,
-	};
+// Every tool supports optional per-call impersonation via `on_behalf_of`, unless
+// the identity is locked to the env default (then the argument is not advertised).
+if (!REDMINE_LOCK_ON_BEHALF_OF) {
+	for (const tool of TOOLS) {
+		tool.inputSchema = tool.inputSchema || { type: "object", properties: {} };
+		tool.inputSchema.properties = {
+			...tool.inputSchema.properties,
+			...ON_BEHALF_OF_PROP,
+		};
+	}
 }
 
 async function handleTool(name, args) {
@@ -581,8 +604,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 	const { name, arguments: rawArgs } = request.params;
 	const args = { ...(rawArgs || {}) };
 	try {
-		// Resolve optional impersonation (per-call arg overrides env default).
-		const identity = (args.on_behalf_of ?? REDMINE_ON_BEHALF_OF) || "";
+		// Resolve optional impersonation. When locked, the env identity is
+		// authoritative and any caller-supplied on_behalf_of is ignored; otherwise
+		// a per-call arg overrides the env default.
+		const identity = REDMINE_LOCK_ON_BEHALF_OF
+			? REDMINE_ON_BEHALF_OF
+			: (args.on_behalf_of ?? REDMINE_ON_BEHALF_OF) || "";
 		delete args.on_behalf_of;
 
 		if (identity && (await ensureAdmin())) {

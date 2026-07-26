@@ -158,6 +158,7 @@ All three read a similar `mcpServers` or `servers` block. Use the same config sh
 | `REDMINE_URL` | ✅ | Base URL of your Redmine instance, e.g. `https://redmine.example.com`. Trailing slashes are OK. |
 | `REDMINE_API_KEY` | ✅ | Personal or service-account API key. Treat it like a password. |
 | `REDMINE_ON_BEHALF_OF` | ⬜ | Default user to act on behalf of — a Redmine **login or email**. Requires `REDMINE_API_KEY` to be an **admin** key. Used as the fallback when a tool call doesn't pass its own `on_behalf_of`. Ignored for non-admin keys. |
+| `REDMINE_LOCK_ON_BEHALF_OF` | ⬜ | When truthy (`1`/`true`/`yes`), **locks** the identity to `REDMINE_ON_BEHALF_OF`: the per-call `on_behalf_of` argument is not advertised and is ignored, so the model cannot impersonate a different user. Use for shared-admin deployments (see Security). |
 
 The key is sent as the `X-Redmine-API-Key` header on every request.
 
@@ -197,6 +198,11 @@ This is fully backward compatible:
 - Set `REDMINE_ON_BEHALF_OF` to impersonate a fixed user by default without
   passing the argument on every call.
 
+> ⚠️ **`on_behalf_of` is an assertion, not authentication.** The server trusts the
+> identity it is given. With an **admin** key, whoever controls the argument can act
+> as *any* user (including admins). See [Security](#-security) for how to deploy this
+> safely.
+
 ## 💡 Example prompts
 
 Once wired up, try asking your AI:
@@ -214,6 +220,43 @@ Once wired up, try asking your AI:
 - Your API key is read from the environment at startup — never hard-code it into a repository.
 - Rotate the key immediately in Redmine if it is ever exposed.
 - See [SECURITY.md](SECURITY.md) for responsible-disclosure contact info.
+
+### Impersonation trust model
+
+`on_behalf_of` is a **user assertion** — the server trusts the identity supplied by
+the caller; it does **not** verify it. The safety of impersonation therefore depends
+entirely on the API key and how the identity is supplied:
+
+- **Personal / non-admin key** (e.g. an individual developer's key): impersonation
+  is impossible — Redmine ignores the switch-user header, so `on_behalf_of` is inert.
+  This is the safest and recommended setup for per-developer clients.
+- **Shared admin key**: whoever controls the `on_behalf_of` value can act as *any*
+  user, including administrators. Because MCP tool arguments are chosen by the model,
+  a compromised or prompt-injected model could pick a different identity or omit it
+  (falling back to full admin). **Do not let the model choose the identity when using
+  an admin key.**
+
+**Deploying an admin key safely (one server per authenticated session):**
+
+1. Have your application (not the model) spawn a redmine-mcp process per logged-in
+   session and set `REDMINE_ON_BEHALF_OF` to that session's verified user.
+2. Set `REDMINE_LOCK_ON_BEHALF_OF=1`. This removes the `on_behalf_of` argument from
+   the advertised tools and ignores any caller-supplied value, so the model cannot
+   change or drop the identity — every request is bound to the session user.
+
+```jsonc
+{
+  "env": {
+    "REDMINE_URL": "https://redmine.example.com",
+    "REDMINE_API_KEY": "an-admin-api-key",
+    "REDMINE_ON_BEHALF_OF": "jdoe@example.com",
+    "REDMINE_LOCK_ON_BEHALF_OF": "1"
+  }
+}
+```
+
+Without the lock, treat any admin-key deployment as trusting the model with full
+administrative authority.
 
 ## 🛠️ Development
 
