@@ -100,6 +100,11 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 	if (query && typeof query === "object") {
 		for (const [k, v] of Object.entries(query)) {
 			if (v === undefined || v === null || v === "") continue;
+			// LLM clients often fill optional numeric filters (tracker_id,
+			// priority_id, etc.) with 0. Redmine filter IDs are never 0, and
+			// forwarding tracker_id=0 silently returns an empty result set, so
+			// drop numeric-zero filters. Pagination is handled explicitly below.
+			if (typeof v === "number" && v === 0 && k !== "offset") continue;
 			url.searchParams.set(k, String(v));
 		}
 	}
@@ -231,6 +236,227 @@ async function resolveLogin(identity) {
 	return match.login;
 }
 
+// ---------------------------------------------------------------------------
+// Named-reference resolution
+// ---------------------------------------------------------------------------
+// LLM callers pass human-facing display names (e.g. project "Bluehive AI",
+// status "New", tracker "Bug") where the Redmine API expects a numeric id or a
+// project identifier ("bluehive-ai"). These helpers transparently map a display
+// name to the value the API accepts. Numeric input, project identifiers, and
+// status keywords (open/closed/*) are passed through untouched.
+
+const _refCache = new Map(); // `${switchUser}:${key}` -> { at, list }
+const REF_CACHE_TTL_MS = 60_000;
+
+async function loadRef(cacheKey, fetcher) {
+	const scope = reqCtx.getStore()?.switchUser || "";
+	const key = `${scope}:${cacheKey}`;
+	const cached = _refCache.get(key);
+	if (cached && Date.now() - cached.at < REF_CACHE_TTL_MS) return cached.list;
+	const list = await fetcher();
+	_refCache.set(key, { at: Date.now(), list });
+	return list;
+}
+
+function slugify(value) {
+	return String(value)
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+}
+
+// Resolve a project reference (numeric id, identifier, or display name) to a
+// value the Redmine API accepts (numeric id or identifier). Resolution is cheap:
+// a slugified direct lookup and a server-side name filter cover the common
+// cases, and results are cached so repeated calls are instant. A full paged
+// scan is only used as a last resort.
+const _projectResolveCache = new Map(); // `${switchUser}:${lower(value)}` -> resolved
+
+async function projectByRef(ref) {
+	try {
+		const data = await redmineRequest(
+			`/projects/${encodeURIComponent(ref)}.json`
+		);
+		return data?.project || null;
+	} catch {
+		return null;
+	}
+}
+
+async function resolveProject(value) {
+	const v = String(value ?? "").trim();
+	if (!v || /^\d+$/.test(v)) return v; // empty or numeric id
+
+	const scope = reqCtx.getStore()?.switchUser || "";
+	const cacheKey = `${scope}:${v.toLowerCase()}`;
+	if (_projectResolveCache.has(cacheKey)) return _projectResolveCache.get(cacheKey);
+
+	const remember = (resolved) => {
+		_projectResolveCache.set(cacheKey, resolved);
+		return resolved;
+	};
+
+	// 1. Slugified direct lookup ("Bluehive AI" -> "bluehive-ai"). Also catches
+	//    values that are already a valid identifier.
+	const slug = slugify(v);
+	if (slug) {
+		const p = await projectByRef(slug);
+		if (p) return remember(p.identifier || String(p.id));
+	}
+
+	// 2. Server-side name filter (a single request even on large instances).
+	try {
+		const data = await redmineRequest("/projects.json", {
+			query: { name: v, limit: 100 },
+		});
+		const projects = data?.projects || [];
+		const lower = v.toLowerCase();
+		const match =
+			projects.find((p) => (p.name || "").trim().toLowerCase() === lower) ||
+			projects.find((p) => p.identifier === v) ||
+			projects.find((p) => p.identifier === slug) ||
+			(projects.length === 1 ? projects[0] : null);
+		if (match) return remember(match.identifier || String(match.id));
+	} catch {
+		/* fall through to full scan */
+	}
+
+	// 3. Last resort: page through every visible project and match by name.
+	try {
+		const all = await loadRef("projects", async () => {
+			const acc = [];
+			let offset = 0;
+			for (;;) {
+				const data = await redmineRequest("/projects.json", {
+					query: { limit: 100, offset },
+				});
+				const batch = data?.projects || [];
+				acc.push(...batch);
+				const total = data?.total_count ?? acc.length;
+				offset += batch.length;
+				if (batch.length === 0 || acc.length >= total) break;
+			}
+			return acc;
+		});
+		const lower = v.toLowerCase();
+		const match =
+			all.find((p) => (p.name || "").trim().toLowerCase() === lower) ||
+			all.find((p) => p.identifier === slug);
+		if (match) return remember(match.identifier || String(match.id));
+	} catch {
+		/* give up */
+	}
+
+	return remember(v); // unknown: pass through unchanged
+}
+
+// Build a resolver for a small global enumeration (trackers, priorities, ...).
+function makeEnumResolver(cacheKey, path, listKey) {
+	return async function (value) {
+		const v = String(value ?? "").trim();
+		if (!v || /^\d+$/.test(v)) return v; // empty or numeric id
+		let items;
+		try {
+			items = await loadRef(cacheKey, async () => {
+				const data = await redmineRequest(path);
+				return data?.[listKey] || [];
+			});
+		} catch {
+			return v;
+		}
+		const match = items.find(
+			(it) => (it.name || "").trim().toLowerCase() === v.toLowerCase()
+		);
+		return match?.id != null ? String(match.id) : v;
+	};
+}
+
+const resolveTracker = makeEnumResolver("trackers", "/trackers.json", "trackers");
+const resolvePriority = makeEnumResolver(
+	"priorities",
+	"/enumerations/issue_priorities.json",
+	"issue_priorities"
+);
+
+// Status accepts the special keywords open/closed/* in addition to ids/names.
+async function resolveStatus(value) {
+	const v = String(value ?? "").trim();
+	if (!v || /^\d+$/.test(v) || /^(open|closed|\*)$/i.test(v)) return v;
+	let items;
+	try {
+		items = await loadRef("statuses", async () => {
+			const data = await redmineRequest("/issue_statuses.json");
+			return data?.issue_statuses || [];
+		});
+	} catch {
+		return v;
+	}
+	const match = items.find(
+		(it) => (it.name || "").trim().toLowerCase() === v.toLowerCase()
+	);
+	return match?.id != null ? String(match.id) : v;
+}
+
+// Resolve a user reference (numeric id, 'me', login, email, or display name) to
+// a numeric user id. Redmine's /users.json?name= search is a loose token match,
+// so we only trust an exact login/email/full-name match — never a lone fuzzy hit.
+const _userResolveCache = new Map(); // `${switchUser}:${lower(value)}` -> resolved
+
+// Fetch users via /users.json?name=. Listing users needs admin rights, so if the
+// impersonated (often non-admin) user is denied, retry with the admin key.
+async function searchUsers(query) {
+	const fetchUsers = async () => {
+		try {
+			const data = await redmineRequest("/users.json", {
+				query: { name: query, limit: 100 },
+			});
+			return data?.users || [];
+		} catch {
+			return [];
+		}
+	};
+	let users = await fetchUsers();
+	if (users.length === 0 && reqCtx.getStore()?.switchUser) {
+		// Re-run without the impersonation header (as the admin key).
+		users = await reqCtx.run({ switchUser: null }, fetchUsers);
+	}
+	return users;
+}
+
+// Strict match: login, email, or exact "firstname lastname" (case-insensitive).
+// No single-result guessing — Redmine's name search is too loose to trust blindly.
+function matchUser(users, value) {
+	const lower = String(value).trim().toLowerCase();
+	const fieldEq = (u, key) => (u?.[key] || "").trim().toLowerCase() === lower;
+	const fullNameEq = (u) =>
+		`${u.firstname || ""} ${u.lastname || ""}`.trim().toLowerCase() === lower;
+	const match =
+		users.find((u) => fieldEq(u, "login")) ||
+		users.find((u) => fieldEq(u, "mail")) ||
+		users.find(fullNameEq);
+	return match?.id != null ? String(match.id) : null;
+}
+
+async function resolveUser(value) {
+	const v = String(value ?? "").trim();
+	if (!v || /^\d+$/.test(v) || /^me$/i.test(v)) return v;
+
+	const scope = reqCtx.getStore()?.switchUser || "";
+	const cacheKey = `${scope}:${v.toLowerCase()}`;
+	if (_userResolveCache.has(cacheKey)) return _userResolveCache.get(cacheKey);
+
+	let users = await searchUsers(v);
+	if (!matchUser(users, v)) {
+		// Redmine's multi-token name search is unreliable (e.g. "Raj Gara" can miss
+		// the real user); retry on the last token (usually the surname).
+		const tokens = v.split(/\s+/);
+		if (tokens.length > 1) users = await searchUsers(tokens[tokens.length - 1]);
+	}
+	const resolved = matchUser(users, v) || v;
+	_userResolveCache.set(cacheKey, resolved);
+	return resolved;
+}
+
 const TOOLS = [
 	{
 		name: "redmine_list_projects",
@@ -256,16 +482,17 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_list_issues",
-		description: "List/search issues with optional filters.",
+		description:
+			"List/search issues with optional filters. project_id/status_id/tracker_id/priority_id and assigned_to_id/author_id accept ids or display names.",
 		inputSchema: {
 			type: "object",
 			properties: {
-				project_id: { type: "string", description: "Project id or identifier to filter by" },
-				assigned_to_id: { type: "string", description: "User id, 'me', or group id" },
-				author_id: { type: "string" },
-				status_id: { type: "string", description: "e.g. 'open', 'closed', '*', or a numeric id" },
-				tracker_id: { type: "integer" },
-				priority_id: { type: "integer" },
+				project_id: { type: "string", description: "Project id, identifier, or display name" },
+				assigned_to_id: { type: "string", description: "User id, 'me', login, email, full name, or group id" },
+				author_id: { type: "string", description: "User id, login, email, or full name" },
+				status_id: { type: "string", description: "'open', 'closed', '*', a status name, or a numeric id" },
+				tracker_id: { type: "string", description: "Tracker id or name (e.g. 'Bug')" },
+				priority_id: { type: "string", description: "Priority id or name" },
 				subject: { type: "string", description: "Match against the subject (use '~term' for contains)" },
 				query_id: { type: "integer", description: "Saved query id" },
 				sort: { type: "string", description: "Sort field, e.g. 'updated_on:desc'" },
@@ -296,13 +523,13 @@ const TOOLS = [
 			type: "object",
 			required: ["project_id", "subject"],
 			properties: {
-				project_id: { type: "string", description: "Project id or identifier" },
+				project_id: { type: "string", description: "Project id, identifier, or display name" },
 				subject: { type: "string" },
 				description: { type: "string" },
-				tracker_id: { type: "integer" },
-				status_id: { type: "integer" },
-				priority_id: { type: "integer" },
-				assigned_to_id: { type: "string" },
+				tracker_id: { type: "string", description: "Tracker id or name" },
+				status_id: { type: "string", description: "Status id or name" },
+				priority_id: { type: "string", description: "Priority id or name" },
+				assigned_to_id: { type: "string", description: "User id, login, email, or full name" },
 				category_id: { type: "integer" },
 				fixed_version_id: { type: "integer" },
 				parent_issue_id: { type: "integer" },
@@ -326,10 +553,10 @@ const TOOLS = [
 				description: { type: "string" },
 				notes: { type: "string", description: "Add a journal note (comment)" },
 				private_notes: { type: "boolean" },
-				status_id: { type: "integer" },
-				priority_id: { type: "integer" },
-				assigned_to_id: { type: "string" },
-				tracker_id: { type: "integer" },
+				status_id: { type: "string", description: "Status id or name" },
+				priority_id: { type: "string", description: "Priority id or name" },
+				assigned_to_id: { type: "string", description: "User id, login, email, or full name" },
+				tracker_id: { type: "string", description: "Tracker id or name" },
 				category_id: { type: "integer" },
 				fixed_version_id: { type: "integer" },
 				done_ratio: { type: "integer", minimum: 0, maximum: 100 },
@@ -473,10 +700,22 @@ async function handleTool(name, args) {
 			return ok(await redmineRequest("/projects.json", { query: args }));
 
 		case "redmine_get_project":
-			return ok(await redmineRequest(`/projects/${encodeURIComponent(args.id)}.json`));
+			return ok(
+				await redmineRequest(
+					`/projects/${encodeURIComponent(await resolveProject(args.id))}.json`
+				)
+			);
 
-		case "redmine_list_issues":
-			return ok(await redmineRequest("/issues.json", { query: args }));
+		case "redmine_list_issues": {
+			const query = { ...args };
+			if (query.project_id) query.project_id = await resolveProject(query.project_id);
+			if (query.tracker_id) query.tracker_id = await resolveTracker(query.tracker_id);
+			if (query.priority_id) query.priority_id = await resolvePriority(query.priority_id);
+			if (query.status_id) query.status_id = await resolveStatus(query.status_id);
+			if (query.assigned_to_id) query.assigned_to_id = await resolveUser(query.assigned_to_id);
+			if (query.author_id) query.author_id = await resolveUser(query.author_id);
+			return ok(await redmineRequest("/issues.json", { query }));
+		}
 
 		case "redmine_get_issue": {
 			const include = args.include || "journals,attachments,children,relations,watchers";
@@ -486,17 +725,26 @@ async function handleTool(name, args) {
 		}
 
 		case "redmine_create_issue": {
-			const { project_id, ...rest } = args;
+			const issue = { ...args };
+			if (issue.project_id) issue.project_id = await resolveProject(issue.project_id);
+			if (issue.tracker_id) issue.tracker_id = await resolveTracker(issue.tracker_id);
+			if (issue.status_id) issue.status_id = await resolveStatus(issue.status_id);
+			if (issue.priority_id) issue.priority_id = await resolvePriority(issue.priority_id);
+			if (issue.assigned_to_id) issue.assigned_to_id = await resolveUser(issue.assigned_to_id);
 			return ok(
 				await redmineRequest("/issues.json", {
 					method: "POST",
-					body: { issue: { project_id, ...rest } },
+					body: { issue },
 				})
 			);
 		}
 
 		case "redmine_update_issue": {
 			const { id, ...rest } = args;
+			if (rest.tracker_id) rest.tracker_id = await resolveTracker(rest.tracker_id);
+			if (rest.status_id) rest.status_id = await resolveStatus(rest.status_id);
+			if (rest.priority_id) rest.priority_id = await resolvePriority(rest.priority_id);
+			if (rest.assigned_to_id) rest.assigned_to_id = await resolveUser(rest.assigned_to_id);
 			await redmineRequest(`/issues/${id}.json`, {
 				method: "PUT",
 				body: { issue: rest },
@@ -522,16 +770,22 @@ async function handleTool(name, args) {
 		case "redmine_search":
 			return ok(await redmineRequest("/search.json", { query: args }));
 
-		case "redmine_list_time_entries":
-			return ok(await redmineRequest("/time_entries.json", { query: args }));
+		case "redmine_list_time_entries": {
+			const query = { ...args };
+			if (query.project_id) query.project_id = await resolveProject(query.project_id);
+			return ok(await redmineRequest("/time_entries.json", { query }));
+		}
 
-		case "redmine_create_time_entry":
+		case "redmine_create_time_entry": {
+			const entry = { ...args };
+			if (entry.project_id) entry.project_id = await resolveProject(entry.project_id);
 			return ok(
 				await redmineRequest("/time_entries.json", {
 					method: "POST",
-					body: { time_entry: args },
+					body: { time_entry: entry },
 				})
 			);
+		}
 
 		case "redmine_list_issue_attachments": {
 			const data = await redmineRequest(`/issues/${args.issue_id}.json`, {
