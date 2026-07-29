@@ -674,7 +674,7 @@ const TOOLS = [
 	{
 		name: "redmine_get_issue",
 		description:
-			"Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, and relations. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'.",
+			`Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, and relations. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'. When referring the user to a ticket, link it as ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -690,7 +690,7 @@ const TOOLS = [
 	{
 		name: "redmine_create_issue",
 		description:
-			"Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call redmine_list_projects first.",
+			`Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call redmine_list_projects first. After creating, show the user the new ticket number as a link: ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
 		inputSchema: {
 			type: "object",
 			required: ["project_id", "subject"],
@@ -1066,6 +1066,7 @@ function createMcpServer() {
 				"To comment on a ticket: use redmine_add_issue_note. To change status, assignee, priority, or other fields: use redmine_update_issue.",
 				"Most filter fields accept human-friendly values: names, logins, emails, or 'me' — you do not need numeric ids.",
 				"To log hours worked: use redmine_create_time_entry. To see who the current user is: redmine_current_user.",
+				`Deep links: whenever you mention an issue/ticket to the user, include a clickable link of the form ${REDMINE_URL || "<redmine-url>"}/issues/<id> (e.g. after creating or finding a ticket). Link a project as ${REDMINE_URL || "<redmine-url>"}/projects/<identifier>, and a specific comment as ${REDMINE_URL || "<redmine-url>"}/issues/<id>#note-<n>.`,
 			].join("\n"),
 		}
 	);
