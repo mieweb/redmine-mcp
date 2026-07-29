@@ -13,8 +13,9 @@
  *                     REDMINE_API_KEY for that request. This lets one server
  *                     process serve many users, each acting as themselves.
  *                     A request may also carry an identity header (by default
- *                     `X-Redmine-User`, `X-Redmine-On-Behalf-Of`, `X-On-Behalf-Of`
- *                     or `X-Ozwell-User-Name`; configurable via REDMINE_USER_HEADERS)
+ *                     `X-Redmine-User`, `X-Redmine-On-Behalf-Of`, `X-On-Behalf-Of`,
+ *                     `X-Ozwell-User-Email` or `X-Ozwell-User-Name`; configurable via
+ *                     REDMINE_USER_HEADERS)
  *                     to set the impersonation identity from the transport layer
  *                     instead of a model-chosen tool argument.
  *
@@ -37,7 +38,7 @@
  *   REDMINE_USER_HEADERS  (optional) Comma-separated, ordered list of incoming request
  *                         headers that may carry the impersonation identity (login or
  *                         email). The first one present on the request wins. Default:
- *                         x-redmine-user,x-redmine-on-behalf-of,x-on-behalf-of,x-ozwell-user-name
+ *                         x-redmine-user,x-redmine-on-behalf-of,x-on-behalf-of,x-ozwell-user-email,x-ozwell-user-name
  *   REDMINE_ON_BEHALF_OF  (optional) Default user to act on behalf of — a Redmine
  *                         login or email. Requires REDMINE_API_KEY to belong to an
  *                         admin. Used as the fallback when a tool call does not pass
@@ -106,7 +107,9 @@ const DEFAULT_USER_HEADERS = [
 	"x-redmine-user", // explicit override
 	"x-redmine-on-behalf-of",
 	"x-on-behalf-of",
-	"x-ozwell-user-name", // Ozwell AI platform (auto)
+	"x-ozwell-user-email", // Ozwell AI platform (auto) — an address we can resolve
+	"x-ozwell-user-name", // Ozwell AI platform (auto) — a DISPLAY name ("Doug Horner"),
+	// only usable as a last resort and only when it happens to be a login
 ];
 const USER_HEADERS = (() => {
 	const configured = (process.env.REDMINE_USER_HEADERS || "")
@@ -381,13 +384,28 @@ async function resolveLogin(identity) {
 	const match = users.find(
 		(u) => (u.mail || "").toLowerCase() === value.toLowerCase()
 	);
-	if (!match?.login) {
-		throw new Error(
-			`Could not resolve '${value}' to a Redmine login (no active user with that email).`
-		);
+	if (match?.login) {
+		_loginCache.set(cacheKey, match.login);
+		return match.login;
 	}
-	_loginCache.set(cacheKey, match.login);
-	return match.login;
+
+	// Fallback: assume the local part of the address is the login. Redmine only
+	// exposes `mail` to admin keys and only for users the key can see, so the
+	// lookup above misses whenever the address is not visible — common with SSO
+	// directories where login and email local part are the same string anyway.
+	// A wrong guess is not silent: Redmine rejects the switch-user with a 412.
+	const localPart = value.slice(0, value.indexOf("@")).trim();
+	if (localPart) {
+		console.error(
+			`[redmine-mcp] no Redmine user found with email '${value}'; assuming login '${localPart}'`
+		);
+		_loginCache.set(cacheKey, localPart);
+		return localPart;
+	}
+
+	throw new Error(
+		`Could not resolve '${value}' to a Redmine login (no active user with that email).`
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,13 +1141,14 @@ function bearerToken(req) {
 // The impersonation identity supplied by the transport: the first configured
 // identity header present on the request wins (REDMINE_USER_HEADERS order). Node
 // joins repeated headers with ", " — take the first value so a smuggled second
-// identity cannot ride along.
+// identity cannot ride along. The header name is returned too, so the log shows
+// which one the identity actually came from.
 function onBehalfOfHeader(req) {
 	for (const name of USER_HEADERS) {
 		const value = String(req.headers?.[name] ?? "").split(",")[0].trim();
-		if (value) return value;
+		if (value) return { name, value };
 	}
-	return "";
+	return { name: "", value: "" };
 }
 
 async function startHttp() {
@@ -1139,7 +1158,7 @@ async function startHttp() {
 		const startedAt = Date.now();
 		const client = clientInfo(req);
 		const apiKey = bearerToken(req);
-		const onBehalfOf = onBehalfOfHeader(req);
+		const identity = onBehalfOfHeader(req);
 
 		// One line per HTTP request, so transport-level traffic (initialize,
 		// tools/list, rejected requests) is visible even when no tool runs.
@@ -1147,7 +1166,8 @@ async function startHttp() {
 			logEvent("http", {
 				method: req.method,
 				path: String(req.url || "").split("?")[0],
-				user: onBehalfOf || "-",
+				user: identity.value || "-",
+				via: identity.name,
 				key: tagFor(apiKey || REDMINE_API_KEY),
 				ip: client.ip,
 				fwd: client.fwd,
@@ -1178,7 +1198,7 @@ async function startHttp() {
 		// AsyncLocalStorage propagates through the transport's async chain, so the
 		// tool handlers see this request's credential, identity and origin.
 		reqCtx
-			.run({ apiKey, onBehalfOf, client }, handle)
+			.run({ apiKey, onBehalfOf: identity.value, client }, handle)
 			.catch((e) => {
 				console.error("[redmine-mcp] http request failed:", e);
 				if (!res.headersSent) {
