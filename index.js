@@ -629,7 +629,8 @@ async function resolveUser(value) {
 const TOOLS = [
 	{
 		name: "redmine_list_projects",
-		description: "List projects visible to the authenticated user.",
+		description:
+			"List Redmine projects visible to the current user. Use this first when you need a project to create or search issues/tickets in and the user didn't specify one.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -640,7 +641,7 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_get_project",
-		description: "Get a single project by id or identifier.",
+		description: "Get details of a single Redmine project by its numeric id or string identifier.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -652,7 +653,7 @@ const TOOLS = [
 	{
 		name: "redmine_list_issues",
 		description:
-			"List/search issues with optional filters. project_id/status_id/tracker_id/priority_id and assigned_to_id/author_id accept ids or display names.",
+			"List or search issues (also called tickets, bugs, tasks, or problem reports) with optional filters. Use for questions like 'show my open tickets', 'what bugs are assigned to X', or 'list issues in project Y'. Filters accept friendly values, not just ids: assigned_to_id/author_id take a name, login, email, or 'me'; status_id takes 'open', 'closed', '*', or a status name; project_id takes an identifier or display name. For free-text search of issue contents, prefer redmine_search.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -672,7 +673,8 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_get_issue",
-		description: "Get a single issue with journals, attachments, children, and relations.",
+		description:
+			"Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, and relations. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -687,7 +689,8 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_create_issue",
-		description: "Create a new issue.",
+		description:
+			"Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call redmine_list_projects first.",
 		inputSchema: {
 			type: "object",
 			required: ["project_id", "subject"],
@@ -712,7 +715,8 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_update_issue",
-		description: "Update an existing issue. Any provided fields are updated.",
+		description:
+			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, edit the subject/description, set % done, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, and tracker.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -737,7 +741,8 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_add_issue_note",
-		description: "Add a comment (journal note) to an issue.",
+		description:
+			"Add a comment (also called a note or reply) to an existing issue/ticket. Use this when the user wants to respond on, comment on, or add information to a ticket without changing its other fields.",
 		inputSchema: {
 			type: "object",
 			required: ["id", "notes"],
@@ -750,7 +755,8 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_list_users",
-		description: "List users (requires admin) or get current user via 'me'.",
+		description:
+			"Search or list Redmine user accounts, e.g. to find someone's id or login before assigning them a ticket. Requires an admin API key. For the current user, use redmine_current_user instead.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -763,12 +769,14 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_current_user",
-		description: "Get the currently authenticated user (based on the API key).",
+		description:
+			"Get the currently authenticated Redmine user — answers 'who am I?' and is useful to confirm identity before filtering issues by 'me'.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
 		name: "redmine_search",
-		description: "Full-text search across Redmine.",
+		description:
+			"Full-text keyword search across Redmine (issues/tickets, wiki pages, news, documents). Use when looking for tickets by words in their text, e.g. 'find tickets mentioning the login page'. For structured filters (status, assignee, project), use redmine_list_issues instead.",
 		inputSchema: {
 			type: "object",
 			required: ["q"],
@@ -786,7 +794,8 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_list_time_entries",
-		description: "List time entries with optional filters.",
+		description:
+			"List logged time (hours worked) with optional filters by user, project, issue/ticket, or date range. Use for questions like 'how many hours did I log this week'.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -802,7 +811,8 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_create_time_entry",
-		description: "Log time against an issue or project.",
+		description:
+			"Log time (hours worked) against an issue/ticket or a project. Use when the user says things like 'log 2 hours on ticket #123'. Provide either issue_id or project_id along with hours.",
 		inputSchema: {
 			type: "object",
 			required: ["hours"],
@@ -819,7 +829,7 @@ const TOOLS = [
 	{
 		name: "redmine_list_issue_attachments",
 		description:
-			"List attachments on an issue (id, filename, content_type, filesize, content_url). Use redmine_get_attachment to download one.",
+			"List the files/screenshots attached to an issue/ticket (returns id, filename, content_type, filesize, content_url). Then use redmine_get_attachment with the id to view or download one.",
 		inputSchema: {
 			type: "object",
 			required: ["issue_id"],
@@ -831,7 +841,7 @@ const TOOLS = [
 	{
 		name: "redmine_get_attachment",
 		description:
-			"Download a Redmine attachment by id. Images (png/jpeg/gif/webp) are returned as MCP image content so the model can view them directly. Other file types are returned as base64 plus metadata. Optionally write the raw bytes to a local path via save_to.",
+			"Download or view a file attached to an issue/ticket, by attachment id (get the id from redmine_get_issue or redmine_list_issue_attachments). Images (png/jpeg/gif/webp) are returned as viewable image content; other file types are returned as base64 plus metadata. Optionally also write the raw bytes to a local path via save_to.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -1046,7 +1056,18 @@ async function handleTool(name, args) {
 function createMcpServer() {
 	const server = new Server(
 		{ name: "redmine-mcp", version: "0.1.0" },
-		{ capabilities: { tools: {} } }
+		{
+			capabilities: { tools: {} },
+			instructions: [
+				"This server connects to Redmine, a project management and issue tracking system.",
+				"Terminology: an 'issue' is the same thing as a ticket, bug, task, defect, feature request, or problem report. When the user says 'ticket', 'bug', 'task', or wants to 'report a problem', use the issue tools.",
+				"To report a problem or file a ticket: use redmine_create_issue (needs a project and a subject). If you don't know the project, call redmine_list_projects first and pick the best match or ask the user.",
+				"To find existing issues/tickets: use redmine_list_issues for filtered lists (by project, assignee, status, etc.) or redmine_search for free-text search. Use redmine_get_issue to read one issue in full, including its comment history.",
+				"To comment on a ticket: use redmine_add_issue_note. To change status, assignee, priority, or other fields: use redmine_update_issue.",
+				"Most filter fields accept human-friendly values: names, logins, emails, or 'me' — you do not need numeric ids.",
+				"To log hours worked: use redmine_create_time_entry. To see who the current user is: redmine_current_user.",
+			].join("\n"),
+		}
 	);
 
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({
