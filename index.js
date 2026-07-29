@@ -12,7 +12,9 @@
  *                     `Authorization: Bearer <redmine-api-key>`, which overrides
  *                     REDMINE_API_KEY for that request. This lets one server
  *                     process serve many users, each acting as themselves.
- *                     A request may also carry `X-Redmine-On-Behalf-Of: <login|email>`
+ *                     A request may also carry an identity header (by default
+ *                     `X-Redmine-User`, `X-Redmine-On-Behalf-Of`, `X-On-Behalf-Of`
+ *                     or `X-Ozwell-User-Name`; configurable via REDMINE_USER_HEADERS)
  *                     to set the impersonation identity from the transport layer
  *                     instead of a model-chosen tool argument.
  *
@@ -26,6 +28,10 @@
  *   MCP_HTTP_HOST         (optional) Bind address for HTTP mode (default 127.0.0.1).
  *   MCP_ALLOWED_HOSTS     (optional) Comma-separated Host header allow-list. When set,
  *                         DNS-rebinding protection is enabled for HTTP mode.
+ *   REDMINE_USER_HEADERS  (optional) Comma-separated, ordered list of incoming request
+ *                         headers that may carry the impersonation identity (login or
+ *                         email). The first one present on the request wins. Default:
+ *                         x-redmine-user,x-redmine-on-behalf-of,x-on-behalf-of,x-ozwell-user-name
  *   REDMINE_ON_BEHALF_OF  (optional) Default user to act on behalf of — a Redmine
  *                         login or email. Requires REDMINE_API_KEY to belong to an
  *                         admin. Used as the fallback when a tool call does not pass
@@ -54,7 +60,7 @@
  *
  *   Identity precedence, most trusted first:
  *     1. REDMINE_ON_BEHALF_OF when REDMINE_LOCK_ON_BEHALF_OF is set (env lock)
- *     2. `X-Redmine-On-Behalf-Of` request header (set by the transport / proxy)
+ *     2. the first REDMINE_USER_HEADERS header present on the request
  *     3. the `on_behalf_of` tool argument (chosen by the model)
  *     4. REDMINE_ON_BEHALF_OF as a plain default
  *   Levels 1 and 2 also hide the `on_behalf_of` argument from tools/list, so the
@@ -85,6 +91,25 @@ const REDMINE_ALLOW_ADMIN = /^(1|true|yes)$/i.test(
 const HTTP_PORT = Number(process.env.MCP_HTTP_PORT || process.env.PORT || 0);
 const HTTP_MODE = process.argv.includes("--http") || HTTP_PORT > 0;
 const HTTP_HOST = process.env.MCP_HTTP_HOST || "127.0.0.1";
+
+// Ordered list of incoming request headers that may carry the impersonation
+// identity (a Redmine login or email). The first header present on the request
+// wins, so an explicit override can be listed ahead of headers injected
+// automatically by an upstream platform.
+const DEFAULT_USER_HEADERS = [
+	"x-redmine-user", // explicit override
+	"x-redmine-on-behalf-of",
+	"x-on-behalf-of",
+	"x-ozwell-user-name", // Ozwell AI platform (auto)
+];
+const USER_HEADERS = (() => {
+	const configured = (process.env.REDMINE_USER_HEADERS || "")
+		.split(",")
+		.map((h) => h.trim().toLowerCase())
+		.filter(Boolean);
+	return [...new Set(configured.length ? configured : DEFAULT_USER_HEADERS)];
+})();
+
 const ALLOWED_HOSTS = (process.env.MCP_ALLOWED_HOSTS || "")
 	.split(",")
 	.map((h) => h.trim())
@@ -762,7 +787,7 @@ const TOOLS = [
 ];
 
 // The identity is "pinned" when it comes from a source the model cannot influence:
-// the env lock, or an `X-Redmine-On-Behalf-Of` header set by the transport/proxy.
+// the env lock, or one of the configured identity headers set by the transport/proxy.
 // Pinned requests ignore (and do not advertise) the `on_behalf_of` argument.
 function pinnedIdentity() {
 	if (REDMINE_LOCK_ON_BEHALF_OF) return REDMINE_ON_BEHALF_OF;
@@ -968,9 +993,9 @@ function createMcpServer() {
 		const { name, arguments: rawArgs } = request.params;
 		const args = { ...(rawArgs || {}) };
 		try {
-			// Resolve optional impersonation. A pinned identity (env lock or
-			// X-Redmine-On-Behalf-Of header) is authoritative and any caller-supplied
-			// on_behalf_of is ignored; otherwise a per-call arg overrides the env default.
+			// Resolve optional impersonation. A pinned identity (env lock or an
+			// identity header) is authoritative and any caller-supplied on_behalf_of
+			// is ignored; otherwise a per-call arg overrides the env default.
 			const pinned = pinnedIdentity();
 			const identity =
 				pinned || (REDMINE_LOCK_ON_BEHALF_OF ? "" : args.on_behalf_of) || REDMINE_ON_BEHALF_OF || "";
@@ -1018,13 +1043,16 @@ function bearerToken(req) {
 	return match ? match[1].trim() : "";
 }
 
-// `X-Redmine-On-Behalf-Of: <login|email>` sets the impersonation identity from the
-// transport layer. Node joins repeated headers with ", " — take the first value so a
-// smuggled second identity cannot ride along.
+// The impersonation identity supplied by the transport: the first configured
+// identity header present on the request wins (REDMINE_USER_HEADERS order). Node
+// joins repeated headers with ", " — take the first value so a smuggled second
+// identity cannot ride along.
 function onBehalfOfHeader(req) {
-	const header =
-		req.headers?.["x-redmine-on-behalf-of"] ?? req.headers?.["x-on-behalf-of"] ?? "";
-	return String(header).split(",")[0].trim();
+	for (const name of USER_HEADERS) {
+		const value = String(req.headers?.[name] ?? "").split(",")[0].trim();
+		if (value) return value;
+	}
+	return "";
 }
 
 async function startHttp() {
@@ -1076,6 +1104,9 @@ async function startHttp() {
 	});
 	console.error(
 		`[redmine-mcp] Streamable HTTP transport listening on http://${HTTP_HOST}:${port}/mcp`
+	);
+	console.error(
+		`[redmine-mcp] impersonation identity headers (in order): ${USER_HEADERS.join(", ")}`
 	);
 }
 

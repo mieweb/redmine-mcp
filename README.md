@@ -161,6 +161,7 @@ All three read a similar `mcpServers` or `servers` block. Use the same config sh
 | `MCP_HTTP_PORT` / `PORT` | ⬜ | Port for the Streamable HTTP transport. Setting either implies `--http`. Default `3000`. |
 | `MCP_HTTP_HOST` | ⬜ | Bind address in HTTP mode. Default `127.0.0.1`. |
 | `MCP_ALLOWED_HOSTS` | ⬜ | Comma-separated `Host` header allow-list. When set, DNS-rebinding protection is enabled. |
+| `REDMINE_USER_HEADERS` | ⬜ | Comma-separated, **ordered** list of incoming request headers that may carry the impersonation identity (login or email); the first present wins. Default `x-redmine-user,x-redmine-on-behalf-of,x-on-behalf-of,x-ozwell-user-name`. |
 | `REDMINE_ON_BEHALF_OF` | ⬜ | Default user to act on behalf of — a Redmine **login or email**. Requires `REDMINE_API_KEY` to be an **admin** key. Used as the fallback when a tool call doesn't pass its own `on_behalf_of`. Ignored for non-admin keys. |
 | `REDMINE_LOCK_ON_BEHALF_OF` | ⬜ | When truthy (`1`/`true`/`yes`), **locks** the identity to `REDMINE_ON_BEHALF_OF`: the per-call `on_behalf_of` argument is not advertised and is ignored, so the model cannot impersonate a different user. Use for shared-admin deployments (see Security). |
 | `REDMINE_ALLOW_ADMIN` | ⬜ | When truthy (`1`/`true`/`yes`), allows tool calls to run as the admin key owner when no impersonation identity is in effect. By default this is **fail-closed**: an admin key with no resolved identity is refused instead of silently acting with full admin privileges. |
@@ -182,7 +183,7 @@ credential and identity:
 ```http
 POST /mcp
 Authorization: Bearer <redmine-api-key>
-X-Redmine-On-Behalf-Of: jdoe@example.com
+X-Redmine-User: jdoe@example.com
 ```
 
 **A request bearer token overrides `REDMINE_API_KEY`.** When no bearer token is
@@ -191,12 +192,36 @@ clear error. Requests are handled statelessly — one MCP server instance per
 request — so concurrent callers with different tokens never share state, and
 caches (admin status, name→id lookups) are scoped per credential.
 
-**`X-Redmine-On-Behalf-Of` sets the impersonation identity** (login or email) for that
+**An identity header sets the impersonation identity** (login or email) for that
 request, overriding the `on_behalf_of` tool argument and `REDMINE_ON_BEHALF_OF`. Because
 it comes from the transport rather than the model, the `on_behalf_of` argument is then
 hidden from `tools/list` and ignored — the same hardening `REDMINE_LOCK_ON_BEHALF_OF`
 gives stdio deployments. This is the recommended way to front a shared admin key with
 an authenticating proxy that injects the end user's identity.
+
+#### Identity header mapping
+
+Upstream platforms use their own header names, so the headers that may carry the
+identity are configurable and **ordered — the first one present on the request wins**.
+Defaults:
+
+| Priority | Header | Purpose |
+| :---: | --- | --- |
+| 1 | `X-Redmine-User` | Explicit override |
+| 2 | `X-Redmine-On-Behalf-Of` | Explicit override (alias) |
+| 3 | `X-On-Behalf-Of` | Explicit override (alias) |
+| 4 | `X-Ozwell-User-Name` | Ozwell AI platform (auto) |
+
+Override the whole list with `REDMINE_USER_HEADERS` (comma-separated, in priority
+order, case-insensitive):
+
+```bash
+REDMINE_USER_HEADERS=x-redmine-user,x-ozwell-user-name,x-forwarded-email
+```
+
+So a request arriving with only `X-Ozwell-User-Name: jdoe@example.com` is sent to
+Redmine as `X-Redmine-Switch-User: jdoe`, while an explicit `X-Redmine-User` on the
+same request takes precedence. The configured list is logged at startup in HTTP mode.
 
 ```jsonc
 {
@@ -260,7 +285,9 @@ as that user. Emails are resolved to the matching login automatically.
 The identity is taken from the first of these that is set:
 
 1. `REDMINE_ON_BEHALF_OF`, when `REDMINE_LOCK_ON_BEHALF_OF` is truthy
-2. the `X-Redmine-On-Behalf-Of` request header (HTTP transport)
+2. the first configured identity header present on the request — `X-Redmine-User`,
+   `X-Redmine-On-Behalf-Of`, `X-On-Behalf-Of` or `X-Ozwell-User-Name` by default
+   (see [Identity header mapping](#identity-header-mapping))
 3. the `on_behalf_of` tool argument
 4. `REDMINE_ON_BEHALF_OF` as a plain default
 
@@ -337,7 +364,7 @@ entirely on the API key and how the identity is supplied:
   a compromised or prompt-injected model could pick a different identity or omit it
   (falling back to full admin). **Do not let the model choose the identity when using
   an admin key.** Supply it out-of-band instead — via `REDMINE_LOCK_ON_BEHALF_OF`
-  (stdio) or the `X-Redmine-On-Behalf-Of` header injected by a trusted proxy (HTTP).
+  (stdio) or an identity header injected by a trusted proxy (HTTP).
   If clients can set that header themselves, it is no stronger than the tool argument.
 
 **Deploying an admin key safely (one server per authenticated session):**

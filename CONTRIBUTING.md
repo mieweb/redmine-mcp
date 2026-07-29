@@ -31,7 +31,8 @@ node index.js --http
 
 It listens on `http://127.0.0.1:3000/mcp`. Send `Authorization: Bearer <api-key>`
 to authenticate per request — it overrides `REDMINE_API_KEY` — and optionally
-`X-Redmine-On-Behalf-Of: <login|email>` to set the impersonation identity.
+`X-Redmine-User: <login|email>` (or any header in `REDMINE_USER_HEADERS`) to set
+the impersonation identity.
 
 ## Guidelines
 

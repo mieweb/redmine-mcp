@@ -15,8 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   HTTP request **overrides** `REDMINE_API_KEY` for that request, so a single server
   process can serve many users, each acting as themselves. `REDMINE_API_KEY` is now
   optional; a call fails only when neither a bearer token nor the env key is available.
-- `X-Redmine-On-Behalf-Of` request header sets the impersonation identity from the
-  transport layer. It overrides the `on_behalf_of` tool argument and
+- Identity headers: an incoming request header can set the impersonation identity from
+  the transport layer. The accepted headers are configurable and ordered via
+  `REDMINE_USER_HEADERS` (default `x-redmine-user`, `x-redmine-on-behalf-of`,
+  `x-on-behalf-of`, `x-ozwell-user-name`) — the first one present on the request wins,
+  so a platform-injected header such as `X-Ozwell-User-Name` is mapped to Redmine's
+  `X-Redmine-Switch-User` automatically while an explicit `X-Redmine-User` still
+  overrides it. A header identity overrides the `on_behalf_of` tool argument and
   `REDMINE_ON_BEHALF_OF`, and — like `REDMINE_LOCK_ON_BEHALF_OF` — hides the argument
   from `tools/list` so the model cannot choose or drop the identity.
 - `systemd/redmine-mcp.service` and `systemd/redmine-mcp.env.example` for running the
