@@ -28,6 +28,12 @@
  *   MCP_HTTP_HOST         (optional) Bind address for HTTP mode (default 127.0.0.1).
  *   MCP_ALLOWED_HOSTS     (optional) Comma-separated Host header allow-list. When set,
  *                         DNS-rebinding protection is enabled for HTTP mode.
+ *   MCP_LOG_REQUESTS      (optional) Request/tool-call audit logging to stderr, on by
+ *                         default. Set to "0"/"false"/"off" to disable. Logs who (the
+ *                         impersonated login and a hashed tag of the API key — never
+ *                         the key itself) and where (peer address, any X-Forwarded-For
+ *                         hop, user agent), plus the tool name, outcome and duration.
+ *                         Tool arguments are never logged.
  *   REDMINE_USER_HEADERS  (optional) Comma-separated, ordered list of incoming request
  *                         headers that may carry the impersonation identity (login or
  *                         email). The first one present on the request wins. Default:
@@ -164,12 +170,11 @@ function currentApiKey() {
 const MISSING_KEY_MESSAGE =
 	"No Redmine API key: set REDMINE_API_KEY or send an 'Authorization: Bearer <redmine-api-key>' header";
 
-// Stable, non-reversible tag for the active API key. Caches are per-key because
-// admin status and visible projects/users differ between credentials — and the
-// raw key must never end up in a cache key that could be logged.
+// Stable, non-reversible tag for an API key. Caches are per-key because admin
+// status and visible projects/users differ between credentials — and the raw key
+// must never end up in a cache key, or a log line, that could leak it.
 const _keyTags = new Map();
-function keyTag() {
-	const key = currentApiKey();
+function tagFor(key) {
 	if (!key) return "anon";
 	let tag = _keyTags.get(key);
 	if (!tag) {
@@ -177,6 +182,47 @@ function keyTag() {
 		_keyTags.set(key, tag);
 	}
 	return tag;
+}
+
+function keyTag() {
+	return tagFor(currentApiKey());
+}
+
+// ---------------------------------------------------------------------------
+// Audit logging
+// ---------------------------------------------------------------------------
+
+const LOG_REQUESTS = !/^(0|false|no|off)$/i.test(
+	(process.env.MCP_LOG_REQUESTS || "").trim()
+);
+
+// Log values come from request headers, so they are attacker-controlled: collapse
+// newlines (log-forging) and cap the length before they reach the journal.
+function logValue(value) {
+	const text = String(value).replace(/[\r\n\t]+/g, " ").trim().slice(0, 200);
+	return /[\s"=]/.test(text) ? JSON.stringify(text) : text;
+}
+
+// One `key=value` line per event, so `journalctl -u redmine-mcp` stays greppable.
+function logEvent(event, fields) {
+	if (!LOG_REQUESTS) return;
+	const parts = [`[redmine-mcp] ${event}`];
+	for (const [key, value] of Object.entries(fields)) {
+		if (value === undefined || value === null || value === "") continue;
+		parts.push(`${key}=${logValue(value)}`);
+	}
+	console.error(parts.join(" "));
+}
+
+// Where the call came from. `fwd` is the first X-Forwarded-For hop: it is set by
+// the client and is only meaningful behind a reverse proxy that overwrites it, so
+// it is logged alongside — never instead of — the real peer address.
+function clientInfo(req) {
+	return {
+		ip: req.socket?.remoteAddress || "",
+		fwd: String(req.headers?.["x-forwarded-for"] || "").split(",")[0].trim(),
+		ua: String(req.headers?.["user-agent"] || ""),
+	};
 }
 
 // Cache scope for the current credential + impersonation identity.
@@ -992,43 +1038,74 @@ function createMcpServer() {
 	server.setRequestHandler(CallToolRequestSchema, async (request) => {
 		const { name, arguments: rawArgs } = request.params;
 		const args = { ...(rawArgs || {}) };
+		const startedAt = Date.now();
+		const client = reqCtx.getStore()?.client || {};
+		// Filled in by dispatchToolCall once the effective identity is known.
+		const audit = { user: "", mode: "" };
+		let result;
+		let failure = "";
 		try {
-			// Resolve optional impersonation. A pinned identity (env lock or an
-			// identity header) is authoritative and any caller-supplied on_behalf_of
-			// is ignored; otherwise a per-call arg overrides the env default.
-			const pinned = pinnedIdentity();
-			const identity =
-				pinned || (REDMINE_LOCK_ON_BEHALF_OF ? "" : args.on_behalf_of) || REDMINE_ON_BEHALF_OF || "";
-			delete args.on_behalf_of;
-
-			if (identity) {
-				if (await ensureAdmin()) {
-					const switchUser = await resolveLogin(identity);
-					return await withCtx({ switchUser }, () => handleTool(name, args));
-				}
-				// Non-admin key: impersonation is a no-op, act as the key owner.
-				return await handleTool(name, args);
-			}
-
-			// No impersonation identity in effect. Fail closed if this would run as a
-			// full admin, unless explicitly opted in via REDMINE_ALLOW_ADMIN. This stops
-			// a misconfigured shared-admin-key deployment from silently executing calls
-			// with admin privileges.
-			if (!REDMINE_ALLOW_ADMIN && (await ensureAdmin())) {
-				throw new Error(
-					"Refusing to run with an admin API key and no impersonation identity. " +
-						"Set REDMINE_ON_BEHALF_OF (and REDMINE_LOCK_ON_BEHALF_OF=1 for shared " +
-						"deployments) to attribute actions to a specific user, or set " +
-						"REDMINE_ALLOW_ADMIN=1 to intentionally act as the admin key owner."
-				);
-			}
-			return await handleTool(name, args);
+			result = await dispatchToolCall(name, args, audit);
 		} catch (e) {
-			return err(e?.message || String(e));
+			failure = e?.message || String(e);
+			result = err(failure);
 		}
+		logEvent("call", {
+			tool: name,
+			user: audit.user || "-",
+			mode: audit.mode,
+			key: keyTag(),
+			ip: client.ip,
+			fwd: client.fwd,
+			ua: client.ua,
+			ms: Date.now() - startedAt,
+			status: failure || result?.isError ? "error" : "ok",
+			error: failure,
+		});
+		return result;
 	});
 
 	return server;
+}
+
+// Resolve the impersonation identity for a tool call and run it. `audit` is
+// populated with the identity actually used so the caller can log who acted.
+async function dispatchToolCall(name, args, audit) {
+	// Resolve optional impersonation. A pinned identity (env lock or an
+	// identity header) is authoritative and any caller-supplied on_behalf_of
+	// is ignored; otherwise a per-call arg overrides the env default.
+	const pinned = pinnedIdentity();
+	const identity =
+		pinned || (REDMINE_LOCK_ON_BEHALF_OF ? "" : args.on_behalf_of) || REDMINE_ON_BEHALF_OF || "";
+	delete args.on_behalf_of;
+
+	if (identity) {
+		if (await ensureAdmin()) {
+			const switchUser = await resolveLogin(identity);
+			audit.user = switchUser;
+			audit.mode = pinned ? "pinned" : "arg";
+			return await withCtx({ switchUser }, () => handleTool(name, args));
+		}
+		// Non-admin key: impersonation is a no-op, act as the key owner.
+		audit.user = identity;
+		audit.mode = "key-owner";
+		return await handleTool(name, args);
+	}
+
+	// No impersonation identity in effect. Fail closed if this would run as a
+	// full admin, unless explicitly opted in via REDMINE_ALLOW_ADMIN. This stops
+	// a misconfigured shared-admin-key deployment from silently executing calls
+	// with admin privileges.
+	if (!REDMINE_ALLOW_ADMIN && (await ensureAdmin())) {
+		throw new Error(
+			"Refusing to run with an admin API key and no impersonation identity. " +
+				"Set REDMINE_ON_BEHALF_OF (and REDMINE_LOCK_ON_BEHALF_OF=1 for shared " +
+				"deployments) to attribute actions to a specific user, or set " +
+				"REDMINE_ALLOW_ADMIN=1 to intentionally act as the admin key owner."
+		);
+	}
+	audit.mode = "key-owner";
+	return await handleTool(name, args);
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1136,27 @@ async function startHttp() {
 	const port = HTTP_PORT || 3000;
 
 	const httpServer = createHttpServer((req, res) => {
+		const startedAt = Date.now();
+		const client = clientInfo(req);
+		const apiKey = bearerToken(req);
+		const onBehalfOf = onBehalfOfHeader(req);
+
+		// One line per HTTP request, so transport-level traffic (initialize,
+		// tools/list, rejected requests) is visible even when no tool runs.
+		res.on("finish", () => {
+			logEvent("http", {
+				method: req.method,
+				path: String(req.url || "").split("?")[0],
+				user: onBehalfOf || "-",
+				key: tagFor(apiKey || REDMINE_API_KEY),
+				ip: client.ip,
+				fwd: client.fwd,
+				ua: client.ua,
+				ms: Date.now() - startedAt,
+				status: res.statusCode,
+			});
+		});
+
 		// Stateless: a fresh Server + transport per request, so concurrent callers
 		// with different bearer tokens never share state.
 		const handle = async () => {
@@ -1078,9 +1176,9 @@ async function startHttp() {
 		};
 
 		// AsyncLocalStorage propagates through the transport's async chain, so the
-		// tool handlers see this request's credential and identity.
+		// tool handlers see this request's credential, identity and origin.
 		reqCtx
-			.run({ apiKey: bearerToken(req), onBehalfOf: onBehalfOfHeader(req) }, handle)
+			.run({ apiKey, onBehalfOf, client }, handle)
 			.catch((e) => {
 				console.error("[redmine-mcp] http request failed:", e);
 				if (!res.headersSent) {

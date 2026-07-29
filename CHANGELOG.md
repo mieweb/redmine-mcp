@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fail-closed protection for admin keys: tool calls made with an admin key and no
   impersonation identity are now refused by default. Set `REDMINE_ALLOW_ADMIN=1` to
   intentionally act as the admin key owner. Non-admin keys are unaffected.
+- Audit logging: one `key=value` line per HTTP request and per tool call on stderr
+  (the journal under systemd), recording who — the resolved Redmine login, how the
+  identity was decided (`pinned`/`arg`/`key-owner`), and a SHA-256 tag of the API key
+  rather than the key itself — and where — peer address, the first `X-Forwarded-For`
+  hop logged alongside it (never instead of it, since a direct client can forge it),
+  and user agent — plus the tool name, duration and outcome. Tool arguments are never
+  logged, and header-derived values are newline-stripped and length-capped to prevent
+  log forging. Set `MCP_LOG_REQUESTS=0` to disable.
 
 ## [0.1.0] - 2026-04-24
 
