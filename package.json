@@ -11,7 +11,8 @@
     "index.js",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "systemd"
   ],
   "scripts": {
     "start": "node index.js",

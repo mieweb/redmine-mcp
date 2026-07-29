@@ -18,8 +18,9 @@ Ask your editor's AI to *"summarize Redmine #12345"*, *"list my open tickets"*, 
 - 🔎 **Search & browse** projects, issues, and users
 - 📝 **Create, update, and comment** on issues from your AI client
 - ⏱️ **Log time entries** against issues or projects
-- 🔐 **API-key auth** only — your credentials never leave the machine
-- 📦 **Zero config beyond two env vars** — one file, stdio transport, no database
+- 🔐 **API-key auth** — from the environment, or per-request `Authorization: Bearer` in HTTP mode
+- 📦 **Zero config beyond two env vars** — one file, no database
+- 🔌 **stdio *and* Streamable HTTP** transports — run it locally or host it for a team
 - 🧩 Works with **any MCP-compatible client**: VS Code, Claude Desktop, Cursor, Windsurf, Zed, …
 
 ## 🧰 Tools
@@ -156,12 +157,96 @@ All three read a similar `mcpServers` or `servers` block. Use the same config sh
 | Variable | Required | Description |
 | --- | :---: | --- |
 | `REDMINE_URL` | ✅ | Base URL of your Redmine instance, e.g. `https://redmine.example.com`. Trailing slashes are OK. |
-| `REDMINE_API_KEY` | ✅ | Personal or service-account API key. Treat it like a password. |
+| `REDMINE_API_KEY` | ⬜* | Personal or service-account API key. Treat it like a password. *Required unless every request supplies an `Authorization: Bearer <key>` header (HTTP mode).* |
+| `MCP_HTTP_PORT` / `PORT` | ⬜ | Port for the Streamable HTTP transport. Setting either implies `--http`. Default `3000`. |
+| `MCP_HTTP_HOST` | ⬜ | Bind address in HTTP mode. Default `127.0.0.1`. |
+| `MCP_ALLOWED_HOSTS` | ⬜ | Comma-separated `Host` header allow-list. When set, DNS-rebinding protection is enabled. |
 | `REDMINE_ON_BEHALF_OF` | ⬜ | Default user to act on behalf of — a Redmine **login or email**. Requires `REDMINE_API_KEY` to be an **admin** key. Used as the fallback when a tool call doesn't pass its own `on_behalf_of`. Ignored for non-admin keys. |
 | `REDMINE_LOCK_ON_BEHALF_OF` | ⬜ | When truthy (`1`/`true`/`yes`), **locks** the identity to `REDMINE_ON_BEHALF_OF`: the per-call `on_behalf_of` argument is not advertised and is ignored, so the model cannot impersonate a different user. Use for shared-admin deployments (see Security). |
 | `REDMINE_ALLOW_ADMIN` | ⬜ | When truthy (`1`/`true`/`yes`), allows tool calls to run as the admin key owner when no impersonation identity is in effect. By default this is **fail-closed**: an admin key with no resolved identity is refused instead of silently acting with full admin privileges. |
 
 The key is sent as the `X-Redmine-API-Key` header on every request.
+
+### 🌐 HTTP transport
+
+By default the server speaks MCP over **stdio**. Pass `--http` (or set `MCP_HTTP_PORT`/`PORT`)
+to serve the **Streamable HTTP** transport instead:
+
+```bash
+REDMINE_URL=https://redmine.example.com MCP_HTTP_PORT=3000 npx -y github:mieweb/redmine-mcp --http
+```
+
+The endpoint is `http://<host>:<port>/mcp`. Each request may carry its own Redmine
+credential and identity:
+
+```http
+POST /mcp
+Authorization: Bearer <redmine-api-key>
+X-Redmine-On-Behalf-Of: jdoe@example.com
+```
+
+**A request bearer token overrides `REDMINE_API_KEY`.** When no bearer token is
+present the env key is used; if neither is available the tool call fails with a
+clear error. Requests are handled statelessly — one MCP server instance per
+request — so concurrent callers with different tokens never share state, and
+caches (admin status, name→id lookups) are scoped per credential.
+
+**`X-Redmine-On-Behalf-Of` sets the impersonation identity** (login or email) for that
+request, overriding the `on_behalf_of` tool argument and `REDMINE_ON_BEHALF_OF`. Because
+it comes from the transport rather than the model, the `on_behalf_of` argument is then
+hidden from `tools/list` and ignored — the same hardening `REDMINE_LOCK_ON_BEHALF_OF`
+gives stdio deployments. This is the recommended way to front a shared admin key with
+an authenticating proxy that injects the end user's identity.
+
+```jsonc
+{
+  "servers": {
+    "redmine": {
+      "type": "http",
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer your-redmine-api-key" }
+    }
+  }
+}
+```
+
+### 🐧 Run as a service (systemd)
+
+[`systemd/redmine-mcp.service`](systemd/redmine-mcp.service) starts the HTTP transport
+on boot and restarts it on failure. Install it:
+
+```bash
+# 1. Code + a dedicated unprivileged user
+sudo git clone https://github.com/mieweb/redmine-mcp.git /opt/redmine-mcp
+sudo npm --prefix /opt/redmine-mcp ci --omit=dev
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin redmine-mcp
+
+# 2. Configuration (contains the API key — keep it root-owned)
+sudo cp /opt/redmine-mcp/systemd/redmine-mcp.env.example /etc/redmine-mcp.env
+sudo chown root:redmine-mcp /etc/redmine-mcp.env
+sudo chmod 0640 /etc/redmine-mcp.env
+sudo editor /etc/redmine-mcp.env
+
+# 3. Unit
+sudo cp /opt/redmine-mcp/systemd/redmine-mcp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now redmine-mcp
+```
+
+Check it:
+
+```bash
+systemctl status redmine-mcp
+journalctl -u redmine-mcp -f
+```
+
+Adjust `ExecStart` if `node` isn't at `/usr/bin/node` (`command -v node`), or if you
+installed from npm instead — then use `ExecStart=/usr/bin/redmine-mcp --http`.
+
+> The unit binds to `127.0.0.1` by default. To serve other machines, terminate TLS at
+> a reverse proxy in front of it rather than exposing the port directly, and set
+> `MCP_ALLOWED_HOSTS`. Ports below 1024 additionally need
+> `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the unit.
 
 ### 👥 User impersonation ("user assertion")
 
@@ -171,6 +256,16 @@ argument (a Redmine **login or email**); the AI supplies the currently logged-in
 user per request. When the key is an admin key, the server resolves the value to a
 login and sends Redmine's `X-Redmine-Switch-User` header so the action is recorded
 as that user. Emails are resolved to the matching login automatically.
+
+The identity is taken from the first of these that is set:
+
+1. `REDMINE_ON_BEHALF_OF`, when `REDMINE_LOCK_ON_BEHALF_OF` is truthy
+2. the `X-Redmine-On-Behalf-Of` request header (HTTP transport)
+3. the `on_behalf_of` tool argument
+4. `REDMINE_ON_BEHALF_OF` as a plain default
+
+Sources 1 and 2 come from outside the model, so they also hide `on_behalf_of` from
+`tools/list` and ignore it if sent.
 
 ```jsonc
 {
@@ -217,7 +312,13 @@ Once wired up, try asking your AI:
 
 ## 🔐 Security
 
-- The server is **stdio-only**; it doesn't open any ports.
+- The server is **stdio-only by default**; it opens a port only when you start it with `--http`.
+- In HTTP mode it binds to `127.0.0.1` unless you set `MCP_HTTP_HOST`. Expose it publicly
+  only behind TLS and an authenticating reverse proxy, and set `MCP_ALLOWED_HOSTS` to
+  enable DNS-rebinding protection.
+- A per-request `Authorization: Bearer <key>` is the preferred way to serve multiple
+  users from one process: each request acts as the key owner, so no shared admin key
+  is needed.
 - Your API key is read from the environment at startup — never hard-code it into a repository.
 - Rotate the key immediately in Redmine if it is ever exposed.
 - See [SECURITY.md](SECURITY.md) for responsible-disclosure contact info.
@@ -235,7 +336,9 @@ entirely on the API key and how the identity is supplied:
   user, including administrators. Because MCP tool arguments are chosen by the model,
   a compromised or prompt-injected model could pick a different identity or omit it
   (falling back to full admin). **Do not let the model choose the identity when using
-  an admin key.**
+  an admin key.** Supply it out-of-band instead — via `REDMINE_LOCK_ON_BEHALF_OF`
+  (stdio) or the `X-Redmine-On-Behalf-Of` header injected by a trusted proxy (HTTP).
+  If clients can set that header themselves, it is no stronger than the tool argument.
 
 **Deploying an admin key safely (one server per authenticated session):**
 

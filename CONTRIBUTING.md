@@ -21,6 +21,18 @@ node index.js
 The server speaks [MCP](https://modelcontextprotocol.io) over stdio. Point any
 MCP client (VS Code, Claude Desktop, etc.) at the command above.
 
+To test the Streamable HTTP transport instead:
+
+```bash
+REDMINE_URL=https://your-redmine.example.com \
+MCP_HTTP_PORT=3000 \
+node index.js --http
+```
+
+It listens on `http://127.0.0.1:3000/mcp`. Send `Authorization: Bearer <api-key>`
+to authenticate per request — it overrides `REDMINE_API_KEY` — and optionally
+`X-Redmine-On-Behalf-Of: <login|email>` to set the impersonation identity.
+
 ## Guidelines
 
 - **Keep it simple.** The whole server fits in a single `index.js` on purpose.

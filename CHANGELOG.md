@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Streamable HTTP transport: run `node index.js --http` (or set `MCP_HTTP_PORT`/`PORT`)
+  to serve MCP over HTTP at `/mcp` in addition to the default stdio transport.
+  `MCP_HTTP_HOST` (default `127.0.0.1`) and `MCP_ALLOWED_HOSTS` (DNS-rebinding
+  protection) tune the listener.
+- Per-request credentials: an `Authorization: Bearer <redmine-api-key>` header on an
+  HTTP request **overrides** `REDMINE_API_KEY` for that request, so a single server
+  process can serve many users, each acting as themselves. `REDMINE_API_KEY` is now
+  optional; a call fails only when neither a bearer token nor the env key is available.
+- `X-Redmine-On-Behalf-Of` request header sets the impersonation identity from the
+  transport layer. It overrides the `on_behalf_of` tool argument and
+  `REDMINE_ON_BEHALF_OF`, and — like `REDMINE_LOCK_ON_BEHALF_OF` — hides the argument
+  from `tools/list` so the model cannot choose or drop the identity.
+- `systemd/redmine-mcp.service` and `systemd/redmine-mcp.env.example` for running the
+  HTTP transport as a hardened system service that starts on boot.
 - User impersonation ("user assertion"): every tool accepts an optional
   `on_behalf_of` argument (Redmine login or email), and a `REDMINE_ON_BEHALF_OF`
   env var provides a default. When the configured API key is an admin key, requests
