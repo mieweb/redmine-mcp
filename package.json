@@ -46,7 +46,7 @@
     "url": "git+https://github.com/mieweb/redmine-mcp.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4"
+    "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "engines": {
     "node": ">=18"
