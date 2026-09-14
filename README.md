@@ -46,7 +46,7 @@ Ask your editor's AI to *"summarize Redmine #12345"*, *"list my open tickets"*, 
 
 ### Prerequisites
 
-- **Node.js 18+**
+- **Node.js 20+**
 - A Redmine instance reachable from your machine
 - A Redmine **API key** (get it from *My account → API access key* in Redmine)
 
@@ -191,6 +191,14 @@ present the env key is used; if neither is available the tool call fails with a
 clear error. Requests are handled statelessly — one MCP server instance per
 request — so concurrent callers with different tokens never share state, and
 caches (admin status, name→id lookups) are scoped per credential.
+
+**Stateless MCP (spec `2026-07-28`).** The endpoint speaks the stateless protocol
+core: no `initialize` handshake, no `Mcp-Session-Id`, every request is
+self-describing via its `_meta` envelope and the `MCP-Protocol-Version` /
+`Mcp-Method` / `Mcp-Name` headers, so any instance behind a plain load balancer can
+answer any request. Clients on the `2025-11-25` revision (and earlier) that still send
+`initialize` are served per request from the same endpoint via the SDK's legacy
+fallback. The stdio transport pins each connection's era from its opening message.
 
 **An identity header sets the impersonation identity** (login or email) for that
 request, overriding the `on_behalf_of` tool argument and `REDMINE_ON_BEHALF_OF`. Because

@@ -77,13 +77,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import {
-	CallToolRequestSchema,
-	ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { Server, createMcpHandler } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { hostHeaderValidation, toNodeHandler } from "@modelcontextprotocol/node";
 
 const REDMINE_URL = (process.env.REDMINE_URL || "").replace(/\/+$/, "");
 const REDMINE_API_KEY = process.env.REDMINE_API_KEY || "";
@@ -1276,11 +1272,11 @@ function createMcpServer() {
 		}
 	);
 
-	server.setRequestHandler(ListToolsRequestSchema, async () => ({
+	server.setRequestHandler("tools/list", async () => ({
 		tools: toolsForRequest(),
 	}));
 
-	server.setRequestHandler(CallToolRequestSchema, async (request) => {
+	server.setRequestHandler("tools/call", async (request) => {
 		const { name, arguments: rawArgs } = request.params;
 		const args = { ...(rawArgs || {}) };
 		const startedAt = Date.now();
@@ -1381,6 +1377,16 @@ function onBehalfOfHeader(req) {
 async function startHttp() {
 	const port = HTTP_PORT || 3000;
 
+	// Stateless MCP (2026-07-28): no initialize handshake, no Mcp-Session-Id. The
+	// factory builds a fresh Server per request, so concurrent callers with
+	// different bearer tokens never share state. 2025-era clients that still send
+	// `initialize` are served per request too via the built-in legacy fallback.
+	const mcpHandler = createMcpHandler(() => createMcpServer(), {
+		onerror: (e) => console.error("[redmine-mcp] mcp handler error:", e),
+	});
+	const handleMcp = toNodeHandler(mcpHandler);
+	const validateHost = ALLOWED_HOSTS.length > 0 ? hostHeaderValidation(ALLOWED_HOSTS) : null;
+
 	const httpServer = createHttpServer((req, res) => {
 		const startedAt = Date.now();
 		const client = clientInfo(req);
@@ -1404,28 +1410,12 @@ async function startHttp() {
 			});
 		});
 
-		// Stateless: a fresh Server + transport per request, so concurrent callers
-		// with different bearer tokens never share state.
-		const handle = async () => {
-			const server = createMcpServer();
-			const transport = new StreamableHTTPServerTransport({
-				sessionIdGenerator: undefined,
-				enableJsonResponse: true,
-				enableDnsRebindingProtection: ALLOWED_HOSTS.length > 0,
-				allowedHosts: ALLOWED_HOSTS.length > 0 ? ALLOWED_HOSTS : undefined,
-			});
-			res.on("close", () => {
-				transport.close().catch(() => {});
-				server.close().catch(() => {});
-			});
-			await server.connect(transport);
-			await transport.handleRequest(req, res);
-		};
+		if (validateHost && !validateHost(req, res)) return;
 
-		// AsyncLocalStorage propagates through the transport's async chain, so the
+		// AsyncLocalStorage propagates through the handler's async chain, so the
 		// tool handlers see this request's credential, identity and origin.
 		reqCtx
-			.run({ apiKey, onBehalfOf: identity.value, client }, handle)
+			.run({ apiKey, onBehalfOf: identity.value, client }, () => handleMcp(req, res))
 			.catch((e) => {
 				console.error("[redmine-mcp] http request failed:", e);
 				if (!res.headersSent) {
@@ -1448,16 +1438,17 @@ async function startHttp() {
 		httpServer.listen(port, HTTP_HOST, resolve);
 	});
 	console.error(
-		`[redmine-mcp] Streamable HTTP transport listening on http://${HTTP_HOST}:${port}/mcp`
+		`[redmine-mcp] Streamable HTTP (stateless, MCP 2026-07-28 + legacy) listening on http://${HTTP_HOST}:${port}/mcp`
 	);
 	console.error(
 		`[redmine-mcp] impersonation identity headers (in order): ${USER_HEADERS.join(", ")}`
 	);
 }
 
+// The opening message pins the connection's era: a 2026-07-28 client goes
+// straight to requests, a 2025-era client still gets the initialize handshake.
 async function startStdio() {
-	const server = createMcpServer();
-	await server.connect(new StdioServerTransport());
+	serveStdio(() => createMcpServer());
 }
 
 (HTTP_MODE ? startHttp() : startStdio()).catch((e) => {

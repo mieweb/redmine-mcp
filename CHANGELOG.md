@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Stateless MCP (spec `2026-07-28`).** Migrated from `@modelcontextprotocol/sdk`
+  v1 to the v2 packages (`@modelcontextprotocol/server`, `@modelcontextprotocol/node`).
+  HTTP mode now uses `createMcpHandler`: no `initialize` handshake, no
+  `Mcp-Session-Id`, every request is self-describing (`_meta` envelope plus
+  `MCP-Protocol-Version` / `Mcp-Method` / `Mcp-Name` headers) so any instance behind a
+  plain load balancer can answer any request. `2025-11-25`-era clients that still send
+  `initialize` are served per request from the same endpoint. stdio uses `serveStdio`,
+  which pins each connection's era from its opening message. Requires **Node.js 20+**.
+
 ### Added
 - Verifiable writes. `redmine_update_issue`, `redmine_create_issue`, and
   `redmine_add_issue_note` now re-read from Redmine after writing and return the
