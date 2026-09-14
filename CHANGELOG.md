@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Accurate counting and full pagination for `redmine_list_issues`. Results are now
+  a summary object whose `total_count` is the true number of matching issues (not
+  the length of one page), with `count`/`has_more` so a caller can tell when more
+  matched than were returned. A new `fetch_all: true` pages through every match
+  (up to 1000) in one call, and `detail: "summary"|"full"` controls whether issues
+  are compact (key columns + set custom fields) or raw. Fixes counts like "how many
+  tickets were created on 8/3" returning a page size (50) instead of the real total
+  (79). (#158063)
+
 - Streamable HTTP transport: run `node index.js --http` (or set `MCP_HTTP_PORT`/`PORT`)
   to serve MCP over HTTP at `/mcp` in addition to the default stdio transport.
   `MCP_HTTP_HOST` (default `127.0.0.1`) and `MCP_ALLOWED_HOSTS` (DNS-rebinding

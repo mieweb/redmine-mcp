@@ -626,6 +626,94 @@ async function resolveUser(value) {
 	return resolved;
 }
 
+// ---------------------------------------------------------------------------
+// Issue listing: counting, pagination, and compact summaries
+// ---------------------------------------------------------------------------
+
+// Hard ceiling on how many issues `fetch_all` will pull into a single response,
+// so "list every ticket" on a large instance can't produce an unbounded payload.
+const FETCH_ALL_CAP = 1000;
+const PAGE_SIZE = 100; // Redmine's max page size.
+
+// Page through /issues.json until every matching issue is collected (or the cap
+// is hit). Returns the authoritative `total_count` from Redmine even when the
+// collected list is capped, so callers can report the true number of matches.
+async function listAllIssues(query) {
+	const acc = [];
+	let offset = 0;
+	let total = 0;
+	for (;;) {
+		const data = await redmineRequest("/issues.json", {
+			query: { ...query, limit: PAGE_SIZE, offset },
+		});
+		const batch = data?.issues || [];
+		total = data?.total_count ?? acc.length + batch.length;
+		acc.push(...batch);
+		offset += batch.length;
+		if (batch.length === 0 || acc.length >= total || acc.length >= FETCH_ALL_CAP) {
+			break;
+		}
+	}
+	return { issues: acc.slice(0, FETCH_ALL_CAP), total_count: total };
+}
+
+// A compact view of an issue for list/count results: the columns people actually
+// scan, plus any set custom fields flattened to name -> value. Full raw objects
+// (with every empty custom field) are only returned when the caller asks for
+// detail: "full" — they bloat the response and make large listings unusable.
+function summarizeIssue(issue) {
+	const customFields = {};
+	for (const field of issue.custom_fields || []) {
+		const value = field.value;
+		const empty =
+			value === "" ||
+			value === null ||
+			value === undefined ||
+			(Array.isArray(value) && value.length === 0);
+		if (!empty) customFields[field.name.trim()] = value;
+	}
+	return {
+		id: issue.id,
+		project: issue.project?.name ?? null,
+		tracker: issue.tracker?.name ?? null,
+		status: issue.status?.name ?? null,
+		priority: issue.priority?.name ?? null,
+		subject: issue.subject ?? null,
+		author: issue.author?.name ?? null,
+		assigned_to: issue.assigned_to?.name ?? null,
+		category: issue.category?.name ?? null,
+		fixed_version: issue.fixed_version?.name ?? null,
+		parent_id: issue.parent?.id ?? null,
+		done_ratio: issue.done_ratio ?? null,
+		is_private: issue.is_private ?? null,
+		start_date: issue.start_date ?? null,
+		due_date: issue.due_date ?? null,
+		estimated_hours: issue.estimated_hours ?? null,
+		spent_hours: issue.spent_hours ?? null,
+		created_on: issue.created_on ?? null,
+		updated_on: issue.updated_on ?? null,
+		closed_on: issue.closed_on ?? null,
+		custom_fields: Object.keys(customFields).length ? customFields : undefined,
+	};
+}
+
+// Wrap a page (or a fetch_all result) with an explicit, unmissable count summary.
+// `total_count` is the true number of matching issues in Redmine — never the
+// length of the returned array — so a caller answering "how many?" reads it
+// directly instead of counting a single capped page.
+function issueListResult({ issues, total_count, limit, offset, detail }) {
+	const returned = issues.length;
+	const from = offset || 0;
+	return {
+		total_count,
+		count: returned,
+		limit: limit ?? undefined,
+		offset: offset ?? undefined,
+		has_more: total_count > from + returned,
+		issues: detail === "full" ? issues : issues.map(summarizeIssue),
+	};
+}
+
 const TOOLS = [
 	{
 		name: "redmine_list_projects",
@@ -653,7 +741,12 @@ const TOOLS = [
 	{
 		name: "redmine_list_issues",
 		description:
-			"List or search issues (also called tickets, bugs, tasks, or problem reports) with optional filters. Use for questions like 'show my open tickets', 'what bugs are assigned to X', or 'list issues in project Y'. Filters accept friendly values, not just ids: assigned_to_id/author_id take a name, login, email, or 'me'; status_id takes 'open', 'closed', '*', or a status name; project_id takes an identifier or display name. For free-text search of issue contents, prefer redmine_search.",
+			"List or count issues (also called tickets, bugs, tasks, or problem reports) with optional filters. Use for questions like 'show my open tickets', 'what bugs are assigned to X', 'list issues in project Y', or 'how many tickets ...'. " +
+			"The result is a summary object: `total_count` is the TRUE number of matching issues in Redmine — always answer 'how many?' from `total_count`, never by counting the `issues` array, which is just one page. " +
+			"A single call returns at most one page (`limit`, default 25, max 100); `has_more: true` means more matched than were returned. To retrieve or count EVERY match across all pages, pass `fetch_all: true` (it pages through automatically, up to " +
+			FETCH_ALL_CAP +
+			" issues). " +
+			"Filters accept friendly values, not just ids: assigned_to_id/author_id take a name, login, email, or 'me'; status_id takes 'open', 'closed', '*', or a status name; project_id takes an identifier or display name. For free-text search of issue contents, prefer redmine_search.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -666,7 +759,20 @@ const TOOLS = [
 				subject: { type: "string", description: "Match against the subject (use '~term' for contains)" },
 				query_id: { type: "integer", description: "Saved query id" },
 				sort: { type: "string", description: "Sort field, e.g. 'updated_on:desc'" },
-				limit: { type: "integer", minimum: 1, maximum: 100 },
+				fetch_all: {
+					type: "boolean",
+					description:
+						"Page through ALL matching issues (up to " +
+						FETCH_ALL_CAP +
+						") instead of a single page. Use when the user wants a complete list or an exact count across more than one page. `total_count` is still authoritative.",
+				},
+				detail: {
+					type: "string",
+					enum: ["summary", "full"],
+					description:
+						"'summary' (default) returns compact issues (key columns + set custom fields). 'full' returns the complete raw Redmine issue objects.",
+				},
+				limit: { type: "integer", minimum: 1, maximum: 100, description: "Max issues per page (default 25, max 100). Ignored when fetch_all is true." },
 				offset: { type: "integer", minimum: 0 },
 			},
 		},
@@ -898,14 +1004,29 @@ async function handleTool(name, args) {
 			);
 
 		case "redmine_list_issues": {
-			const query = { ...args };
+			const { fetch_all, detail, ...filters } = args;
+			const query = { ...filters };
 			if (query.project_id) query.project_id = await resolveProject(query.project_id);
 			if (query.tracker_id) query.tracker_id = await resolveTracker(query.tracker_id);
 			if (query.priority_id) query.priority_id = await resolvePriority(query.priority_id);
 			if (query.status_id) query.status_id = await resolveStatus(query.status_id);
 			if (query.assigned_to_id) query.assigned_to_id = await resolveUser(query.assigned_to_id);
 			if (query.author_id) query.author_id = await resolveUser(query.author_id);
-			return ok(await redmineRequest("/issues.json", { query }));
+
+			if (fetch_all) {
+				const { issues, total_count } = await listAllIssues(query);
+				return ok(issueListResult({ issues, total_count, offset: 0, detail }));
+			}
+			const data = await redmineRequest("/issues.json", { query });
+			return ok(
+				issueListResult({
+					issues: data?.issues || [],
+					total_count: data?.total_count ?? (data?.issues || []).length,
+					limit: data?.limit,
+					offset: data?.offset,
+					detail,
+				})
+			);
 		}
 
 		case "redmine_get_issue": {
