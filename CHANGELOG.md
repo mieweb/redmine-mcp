@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Friendly date and column mapping for `redmine_list_issues`. New `created_on`
+  and `updated_on` filters accept a plain date (`2026-08-03` = that whole day), a
+  `from|to` range, or an operator (`>=2026-08-01`) and are normalized to Redmine's
+  query syntax automatically, plus new `category_id` and `done_ratio` filters.
+  Tool and server descriptions now map everyday words (created/opened/added ->
+  created_on, modified/changed/updated -> updated_on, etc.) so callers no longer
+  have to guess the "magic" filter name. (#158064)
+
 - Accurate counting and full pagination for `redmine_list_issues`. Results are now
   a summary object whose `total_count` is the true number of matching issues (not
   the length of one page), with `count`/`has_more` so a caller can tell when more

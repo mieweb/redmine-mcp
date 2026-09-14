@@ -657,6 +657,28 @@ async function listAllIssues(query) {
 	return { issues: acc.slice(0, FETCH_ALL_CAP), total_count: total };
 }
 
+// Turn a human-friendly date filter into the operator syntax Redmine expects.
+// People say "created on 2026-08-03" or give a range; Redmine wants ">=|<=" style
+// operators. We accept:
+//   "2026-08-03"                 -> the whole day  (><2026-08-03|2026-08-03)
+//   "2026-08-01|2026-08-31"      -> inclusive range (><2026-08-01|2026-08-31)
+//   ">=2026-08-01", "<2026-09"   -> operator forms pass straight through
+//   "><2026-08-01|2026-08-31"    -> already normalized, passes through
+function normalizeDateFilter(value) {
+	if (value == null) return value;
+	const raw = String(value).trim();
+	if (!raw) return raw;
+	// Already an operator/range expression — trust the caller.
+	if (/^(><|>=|<=|>|<)/.test(raw)) return raw;
+	if (raw.includes("|")) {
+		const [from, to] = raw.split("|").map((s) => s.trim());
+		return `><${from}|${to}`;
+	}
+	// A bare date means "that whole day": between the day and itself, inclusive.
+	if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return `><${raw}|${raw}`;
+	return raw;
+}
+
 // A compact view of an issue for list/count results: the columns people actually
 // scan, plus any set custom fields flattened to name -> value. Full raw objects
 // (with every empty custom field) are only returned when the caller asks for
@@ -746,7 +768,8 @@ const TOOLS = [
 			"A single call returns at most one page (`limit`, default 25, max 100); `has_more: true` means more matched than were returned. To retrieve or count EVERY match across all pages, pass `fetch_all: true` (it pages through automatically, up to " +
 			FETCH_ALL_CAP +
 			" issues). " +
-			"Filters accept friendly values, not just ids: assigned_to_id/author_id take a name, login, email, or 'me'; status_id takes 'open', 'closed', '*', or a status name; project_id takes an identifier or display name. For free-text search of issue contents, prefer redmine_search.",
+			"Filters accept friendly values, not just ids: assigned_to_id/author_id take a name, login, email, or 'me'; status_id takes 'open', 'closed', '*', or a status name; project_id takes an identifier or display name. " +
+			"To filter by WHEN an issue was opened/created/added, use created_on; by when it was last changed/modified/updated, use updated_on — both take a plain date like '2026-08-03', a 'from|to' range, or an operator like '>=2026-08-01'. For free-text search of issue contents, prefer redmine_search.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -756,7 +779,19 @@ const TOOLS = [
 				status_id: { type: "string", description: "'open', 'closed', '*', a status name, or a numeric id" },
 				tracker_id: { type: "string", description: "Tracker id or name (e.g. 'Bug')" },
 				priority_id: { type: "string", description: "Priority id or name" },
+				category_id: { type: "integer", description: "Issue category id" },
+				done_ratio: { type: "integer", minimum: 0, maximum: 100, description: "% done (0-100)" },
 				subject: { type: "string", description: "Match against the subject (use '~term' for contains)" },
+				created_on: {
+					type: "string",
+					description:
+						"Filter by creation date (synonyms: created, opened, added, filed, reported). A plain date '2026-08-03' means that whole day; use 'from|to' for an inclusive range or an operator like '>=2026-08-01', '<=2026-08-31'.",
+				},
+				updated_on: {
+					type: "string",
+					description:
+						"Filter by last-updated date (synonyms: updated, modified, changed, edited, touched). Same formats as created_on: a plain date, a 'from|to' range, or an operator like '>=2026-08-01'.",
+				},
 				query_id: { type: "integer", description: "Saved query id" },
 				sort: { type: "string", description: "Sort field, e.g. 'updated_on:desc'" },
 				fetch_all: {
@@ -1012,6 +1047,8 @@ async function handleTool(name, args) {
 			if (query.status_id) query.status_id = await resolveStatus(query.status_id);
 			if (query.assigned_to_id) query.assigned_to_id = await resolveUser(query.assigned_to_id);
 			if (query.author_id) query.author_id = await resolveUser(query.author_id);
+			if (query.created_on) query.created_on = normalizeDateFilter(query.created_on);
+			if (query.updated_on) query.updated_on = normalizeDateFilter(query.updated_on);
 
 			if (fetch_all) {
 				const { issues, total_count } = await listAllIssues(query);
@@ -1184,6 +1221,8 @@ function createMcpServer() {
 				"Terminology: an 'issue' is the same thing as a ticket, bug, task, defect, feature request, or problem report. When the user says 'ticket', 'bug', 'task', or wants to 'report a problem', use the issue tools.",
 				"To report a problem or file a ticket: use redmine_create_issue (needs a project and a subject). If you don't know the project, call redmine_list_projects first and pick the best match or ask the user.",
 				"To find existing issues/tickets: use redmine_list_issues for filtered lists (by project, assignee, status, etc.) or redmine_search for free-text search. Use redmine_get_issue to read one issue in full, including its comment history.",
+				"Mapping everyday words to redmine_list_issues filters: 'created/opened/added/filed/reported/new since <date>' -> created_on; 'updated/modified/changed/edited/touched since <date>' -> updated_on; 'assigned to <person/me>' -> assigned_to_id; 'reported/opened by <person>' -> author_id; 'in <project>' -> project_id; 'of type/tracker <bug/feature>' -> tracker_id; '<priority>' -> priority_id; 'category' -> category_id; '% done/progress' -> done_ratio; 'open/closed' -> status_id. Dates take a plain 'YYYY-MM-DD' (a whole day), a 'from|to' range, or an operator like '>=YYYY-MM-DD'.",
+				"For counts ('how many ...') read total_count from the result, never the length of the issues array; for a complete list across pages pass fetch_all: true.",
 				"To comment on a ticket: use redmine_add_issue_note. To change status, assignee, priority, or other fields: use redmine_update_issue.",
 				"Most filter fields accept human-friendly values: names, logins, emails, or 'me' — you do not need numeric ids.",
 				"To log hours worked: use redmine_create_time_entry. To see who the current user is: redmine_current_user.",
