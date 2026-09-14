@@ -283,6 +283,14 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 				`Redmine impersonation failed: user '${switchUser}' does not exist or is not active (X-Redmine-Switch-User returned 412).`
 			);
 		}
+		// Redmine reports validation problems (422) as { errors: [...] }. Surface
+		// them verbatim so the caller sees *why* a write was rejected instead of a
+		// generic status code — e.g. "Subject cannot be blank".
+		if (Array.isArray(json?.errors) && json.errors.length) {
+			throw new Error(
+				`Redmine ${method} ${url.pathname} rejected (${res.status}): ${json.errors.join("; ")}`
+			);
+		}
 		throw new Error(
 			`Redmine ${method} ${url.pathname} failed: ${res.status} ${res.statusText} - ${text.slice(0, 500)}`
 		);
@@ -736,6 +744,15 @@ function issueListResult({ issues, total_count, limit, offset, detail }) {
 	};
 }
 
+// Re-read an issue and return its compact summary. Used after a write so the tool
+// reports the issue's ACTUAL state from Redmine instead of blindly claiming
+// success — a PUT returns 204 No Content, so without this a failed or no-op
+// update would still look like it worked.
+async function fetchIssueSummary(id) {
+	const data = await redmineRequest(`/issues/${id}.json`);
+	return data?.issue ? summarizeIssue(data.issue) : null;
+}
+
 const TOOLS = [
 	{
 		name: "redmine_list_projects",
@@ -831,7 +848,7 @@ const TOOLS = [
 	{
 		name: "redmine_create_issue",
 		description:
-			`Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call redmine_list_projects first. After creating, show the user the new ticket number as a link: ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
+			`Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call redmine_list_projects first. Returns the created issue's id, a direct url, and a summary so you can confirm it was created; show the user the new ticket as a link: ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
 		inputSchema: {
 			type: "object",
 			required: ["project_id", "subject"],
@@ -857,7 +874,7 @@ const TOOLS = [
 	{
 		name: "redmine_update_issue",
 		description:
-			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, edit the subject/description, set % done, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, and tracker.",
+			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, edit the subject/description, set % done, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, and tracker. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -883,7 +900,7 @@ const TOOLS = [
 	{
 		name: "redmine_add_issue_note",
 		description:
-			"Add a comment (also called a note or reply) to an existing issue/ticket. Use this when the user wants to respond on, comment on, or add information to a ticket without changing its other fields.",
+			"Add a comment (also called a note or reply) to an existing issue/ticket. Use this when the user wants to respond on, comment on, or add information to a ticket without changing its other fields. On success it re-reads the issue and returns the recorded note (id and timestamp) so you can confirm it actually posted.",
 		inputSchema: {
 			type: "object",
 			required: ["id", "notes"],
@@ -1080,12 +1097,17 @@ async function handleTool(name, args) {
 			if (issue.status_id) issue.status_id = await resolveStatus(issue.status_id);
 			if (issue.priority_id) issue.priority_id = await resolvePriority(issue.priority_id);
 			if (issue.assigned_to_id) issue.assigned_to_id = await resolveUser(issue.assigned_to_id);
-			return ok(
-				await redmineRequest("/issues.json", {
-					method: "POST",
-					body: { issue },
-				})
-			);
+			const created = await redmineRequest("/issues.json", {
+				method: "POST",
+				body: { issue },
+			});
+			const newId = created?.issue?.id;
+			return ok({
+				ok: true,
+				id: newId,
+				url: newId && REDMINE_URL ? `${REDMINE_URL}/issues/${newId}` : undefined,
+				issue: created?.issue ? summarizeIssue(created.issue) : null,
+			});
 		}
 
 		case "redmine_update_issue": {
@@ -1094,11 +1116,20 @@ async function handleTool(name, args) {
 			if (rest.status_id) rest.status_id = await resolveStatus(rest.status_id);
 			if (rest.priority_id) rest.priority_id = await resolvePriority(rest.priority_id);
 			if (rest.assigned_to_id) rest.assigned_to_id = await resolveUser(rest.assigned_to_id);
+			// Redmine's PUT returns 204 No Content, so re-read the issue to confirm
+			// the change actually landed rather than assuming success.
 			await redmineRequest(`/issues/${id}.json`, {
 				method: "PUT",
 				body: { issue: rest },
 			});
-			return ok({ ok: true, id });
+			const updated = await fetchIssueSummary(id);
+			return ok({
+				ok: true,
+				id,
+				updated_fields: Object.keys(rest),
+				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
+				issue: updated,
+			});
 		}
 
 		case "redmine_add_issue_note": {
@@ -1107,7 +1138,21 @@ async function handleTool(name, args) {
 				method: "PUT",
 				body: { issue: { notes, private_notes } },
 			});
-			return ok({ ok: true, id });
+			// Confirm the note by re-reading the issue's journals and returning the
+			// one we just added, so the caller can see it was really recorded.
+			const data = await redmineRequest(`/issues/${id}.json`, {
+				query: { include: "journals" },
+			});
+			const journals = data?.issue?.journals || [];
+			const lastNote = [...journals].reverse().find((j) => j.notes);
+			return ok({
+				ok: true,
+				id,
+				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
+				note: lastNote
+					? { id: lastNote.id, created_on: lastNote.created_on, private_notes: !!lastNote.private_notes, notes: lastNote.notes }
+					: null,
+			});
 		}
 
 		case "redmine_list_users":

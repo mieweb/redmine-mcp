@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- Verifiable writes. `redmine_update_issue`, `redmine_create_issue`, and
+  `redmine_add_issue_note` now re-read from Redmine after writing and return the
+  resulting issue (or the recorded note), instead of assuming success — a PUT
+  returns 204 No Content, so a failed or no-op update previously still looked like
+  it worked. `create` also returns the new id and a direct url. (#158273)
+
+### Fixed
+- Redmine validation failures (HTTP 422) are surfaced with Redmine's exact reason
+  (e.g. "Subject cannot be blank") instead of a bare status code, so rejected
+  updates/creates report *why* they failed. (#158273)
+
 - Friendly date and column mapping for `redmine_list_issues`. New `created_on`
   and `updated_on` filters accept a plain date (`2026-08-03` = that whole day), a
   `from|to` range, or an operator (`>=2026-08-01`) and are normalized to Redmine's
