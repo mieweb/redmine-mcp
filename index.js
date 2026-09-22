@@ -524,8 +524,29 @@ async function resolveProject(value) {
 	return remember(v); // unknown: pass through unchanged
 }
 
+// Match a human name against a list of { id, name }. Exact match first; then a
+// unique match on the leading word(s), since instances often decorate names
+// ("Normal" -> "Normal - Minor"). Throws with the valid names when nothing
+// matches — forwarding the raw string would only fail later in Redmine with a
+// misleading "cannot be blank".
+function matchByName(items, value, kind) {
+	const lower = value.toLowerCase();
+	const norm = (it) => (it.name || "").trim().toLowerCase();
+	let match = items.find((it) => norm(it) === lower);
+	if (!match) {
+		const prefixed = items.filter((it) => new RegExp(`^${lower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\b|\\s)`).test(norm(it)));
+		if (prefixed.length === 1) match = prefixed[0];
+	}
+	if (match?.id == null) {
+		throw new Error(
+			`Unknown ${kind} '${value}'. Valid values: ${items.map((it) => `"${(it.name || "").trim()}"`).join(", ")}`
+		);
+	}
+	return String(match.id);
+}
+
 // Build a resolver for a small global enumeration (trackers, priorities, ...).
-function makeEnumResolver(cacheKey, path, listKey) {
+function makeEnumResolver(cacheKey, path, listKey, kind) {
 	return async function (value) {
 		const v = String(value ?? "").trim();
 		if (!v || /^\d+$/.test(v)) return v; // empty or numeric id
@@ -538,18 +559,16 @@ function makeEnumResolver(cacheKey, path, listKey) {
 		} catch {
 			return v;
 		}
-		const match = items.find(
-			(it) => (it.name || "").trim().toLowerCase() === v.toLowerCase()
-		);
-		return match?.id != null ? String(match.id) : v;
+		return matchByName(items, v, kind);
 	};
 }
 
-const resolveTracker = makeEnumResolver("trackers", "/trackers.json", "trackers");
+const resolveTracker = makeEnumResolver("trackers", "/trackers.json", "trackers", "tracker");
 const resolvePriority = makeEnumResolver(
 	"priorities",
 	"/enumerations/issue_priorities.json",
-	"issue_priorities"
+	"issue_priorities",
+	"priority"
 );
 
 // Status accepts the special keywords open/closed/* in addition to ids/names.
@@ -565,10 +584,7 @@ async function resolveStatus(value) {
 	} catch {
 		return v;
 	}
-	const match = items.find(
-		(it) => (it.name || "").trim().toLowerCase() === v.toLowerCase()
-	);
-	return match?.id != null ? String(match.id) : v;
+	return matchByName(items, v, "status");
 }
 
 // Resolve a user reference (numeric id, 'me', login, email, or display name) to
@@ -749,6 +765,94 @@ async function fetchIssueSummary(id) {
 	return data?.issue ? summarizeIssue(data.issue) : null;
 }
 
+// LLM clients fill optional fields with 0 / "" / null. Redmine treats an explicit
+// 0 id as a reference to a record that does not exist ("Priority cannot be
+// blank", "Category is not included in the list"), so drop them before sending.
+function compactIssueFields(fields) {
+	const out = {};
+	for (const [k, v] of Object.entries(fields)) {
+		if (v === undefined || v === null || v === "") continue;
+		if (k.endsWith("_id") && (v === 0 || v === "0")) continue;
+		if (Array.isArray(v) && v.length === 0) continue;
+		out[k] = v;
+	}
+	return out;
+}
+
+// Custom fields (id + name) enabled for issues in a project. Visible to any
+// member, unlike the admin-only /custom_fields.json catalog.
+async function projectCustomFields(projectRef) {
+	return loadRef(`cf:${projectRef}`, async () => {
+		const data = await redmineRequest(
+			`/projects/${encodeURIComponent(projectRef)}.json`,
+			{ query: { include: "issue_custom_fields" } }
+		);
+		return data?.project?.issue_custom_fields || [];
+	});
+}
+
+// The global custom field catalog (with possible_values). Admin-only; empty
+// when the key is not an admin so hints simply omit the value list.
+async function customFieldCatalog() {
+	return loadRef("cf:catalog", async () => {
+		try {
+			const data = await redmineRequest("/custom_fields.json");
+			return data?.custom_fields || [];
+		} catch {
+			return [];
+		}
+	});
+}
+
+// Turn { "Is Billable (EH)?": "No" } / { "49": "No" } (or Redmine's own
+// [{ id, value }] array) into the [{ id, value }] list the API expects, mapping
+// names to ids case-insensitively against `defs`.
+function toCustomFieldList(input, defs) {
+	const entries = Array.isArray(input)
+		? input.map((f) => [f.id ?? f.name, f.value])
+		: Object.entries(input || {});
+	const list = [];
+	for (const [key, value] of entries) {
+		if (value === undefined || value === null) continue;
+		const k = String(key).trim();
+		const def = /^\d+$/.test(k)
+			? { id: Number(k) }
+			: defs.find((d) => (d.name || "").trim().toLowerCase() === k.toLowerCase());
+		if (!def) {
+			throw new Error(
+				`Unknown custom field '${k}'. Available: ${defs.map((d) => `"${d.name.trim()}" (id ${d.id})`).join(", ") || "none"}`
+			);
+		}
+		list.push({ id: def.id, value });
+	}
+	return list.length ? list : undefined;
+}
+
+// When Redmine rejects a create because a project-required custom field is
+// blank, tell the caller exactly which field to pass (and its allowed values
+// when we can see them) so the retry can succeed without guessing.
+async function withCustomFieldHint(message, projectRef) {
+	if (!/cannot be blank/i.test(message)) return message;
+	let defs;
+	try {
+		defs = await projectCustomFields(projectRef);
+	} catch {
+		return message;
+	}
+	const lower = message.toLowerCase();
+	const missing = defs.filter((d) =>
+		lower.includes(`${d.name.trim().toLowerCase()} cannot be blank`)
+	);
+	if (!missing.length) return message;
+	const catalog = await customFieldCatalog();
+	const describe = (d) => {
+		const values = catalog.find((c) => c.id === d.id)?.possible_values?.map((p) => p.value);
+		return `"${d.name.trim()}"${values?.length ? ` (one of: ${values.join(", ")})` : ""}`;
+	};
+	const example = missing.map((d) => `"${d.name.trim()}": "<value>"`).join(", ");
+	return `${message}. This project requires custom field(s) ${missing.map(describe).join(", ")}. Retry with custom_fields, e.g. "custom_fields": {${example}}`;
+}
+
 const TOOLS = [
 	{
 		name: "redmine_list_projects",
@@ -844,7 +948,7 @@ const TOOLS = [
 	{
 		name: "redmine_create_issue",
 		description:
-			`Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call redmine_list_projects first. Returns the created issue's id, a direct url, and a summary so you can confirm it was created; show the user the new ticket as a link: ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
+			`Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call redmine_list_projects first. Omit optional fields you don't have a real value for (never send 0 or "" as an id). Some projects require custom fields; if the create is rejected with '<field> cannot be blank', retry passing that field in 'custom_fields'. Returns the created issue's id, a direct url, and a summary so you can confirm it was created; show the user the new ticket as a link: ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
 		inputSchema: {
 			type: "object",
 			required: ["project_id", "subject"],
@@ -864,6 +968,12 @@ const TOOLS = [
 				estimated_hours: { type: "number" },
 				done_ratio: { type: "integer", minimum: 0, maximum: 100 },
 				watcher_user_ids: { type: "array", items: { type: "integer" } },
+				custom_fields: {
+					type: "object",
+					description:
+						"Custom field values keyed by field name or numeric id, e.g. {\"Is Billable (EH)?\": \"No\"}. Required by some projects.",
+					additionalProperties: true,
+				},
 			},
 		},
 	},
@@ -890,6 +1000,12 @@ const TOOLS = [
 				due_date: { type: "string" },
 				start_date: { type: "string" },
 				estimated_hours: { type: "number" },
+				custom_fields: {
+					type: "object",
+					description:
+						"Custom field values keyed by field name or numeric id, e.g. {\"Is Billable (EH)?\": \"No\"}.",
+					additionalProperties: true,
+				},
 			},
 		},
 	},
@@ -1087,16 +1203,27 @@ async function handleTool(name, args) {
 		}
 
 		case "redmine_create_issue": {
-			const issue = { ...args };
+			const issue = compactIssueFields(args);
 			if (issue.project_id) issue.project_id = await resolveProject(issue.project_id);
 			if (issue.tracker_id) issue.tracker_id = await resolveTracker(issue.tracker_id);
 			if (issue.status_id) issue.status_id = await resolveStatus(issue.status_id);
 			if (issue.priority_id) issue.priority_id = await resolvePriority(issue.priority_id);
 			if (issue.assigned_to_id) issue.assigned_to_id = await resolveUser(issue.assigned_to_id);
-			const created = await redmineRequest("/issues.json", {
-				method: "POST",
-				body: { issue },
-			});
+			if (issue.custom_fields) {
+				issue.custom_fields = toCustomFieldList(
+					issue.custom_fields,
+					await projectCustomFields(issue.project_id)
+				);
+			}
+			let created;
+			try {
+				created = await redmineRequest("/issues.json", {
+					method: "POST",
+					body: { issue },
+				});
+			} catch (e) {
+				throw new Error(await withCustomFieldHint(e?.message || String(e), issue.project_id));
+			}
 			const newId = created?.issue?.id;
 			return ok({
 				ok: true,
@@ -1107,11 +1234,19 @@ async function handleTool(name, args) {
 		}
 
 		case "redmine_update_issue": {
-			const { id, ...rest } = args;
+			const { id, ...rest } = compactIssueFields(args);
 			if (rest.tracker_id) rest.tracker_id = await resolveTracker(rest.tracker_id);
 			if (rest.status_id) rest.status_id = await resolveStatus(rest.status_id);
 			if (rest.priority_id) rest.priority_id = await resolvePriority(rest.priority_id);
 			if (rest.assigned_to_id) rest.assigned_to_id = await resolveUser(rest.assigned_to_id);
+			if (rest.custom_fields) {
+				const current = (await redmineRequest(`/issues/${id}.json`))?.issue;
+				const defs = [
+					...(current?.custom_fields || []),
+					...(current?.project?.id ? await projectCustomFields(current.project.id) : []),
+				];
+				rest.custom_fields = toCustomFieldList(rest.custom_fields, defs);
+			}
 			// Redmine's PUT returns 204 No Content, so re-read the issue to confirm
 			// the change actually landed rather than assuming success.
 			await redmineRequest(`/issues/${id}.json`, {

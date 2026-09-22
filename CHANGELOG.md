@@ -24,6 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it worked. `create` also returns the new id and a direct url. (#158273)
 
 ### Fixed
+- Issue creates from LLM clients no longer fail with a wall of unrelated 422 errors
+  ("Priority cannot be blank", "Category is not included in the list", "Parent task
+  is invalid", ...). Models routinely fill optional ids with `0`/`""`; those are now
+  stripped from create/update bodies before they reach Redmine, matching what the
+  query path already did.
+- Enum names resolve on the leading word(s) when an instance decorates them
+  (`"Normal"` -> `"Normal - Minor"`), and an unknown status/priority/tracker name is
+  rejected up front with the list of valid names instead of being forwarded and
+  surfacing later as a misleading "cannot be blank".
+- Projects with required custom fields (e.g. `"Is Billable (EH)?"`) can now be
+  written to: `redmine_create_issue` / `redmine_update_issue` accept
+  `custom_fields` keyed by field name or id, and a create rejected for a blank
+  required custom field says exactly which field to pass (with its allowed values
+  when the key is an admin).
+
 - Redmine validation failures (HTTP 422) are surfaced with Redmine's exact reason
   (e.g. "Subject cannot be blank") instead of a bare status code, so rejected
   updates/creates report *why* they failed. (#158273)
