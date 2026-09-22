@@ -868,12 +868,13 @@ const TOOLS = [
 	},
 	{
 		name: "redmine_get_project",
-		description: "Get details of a single Redmine project by its numeric id or string identifier.",
+		description:
+			"Get details of a single Redmine project by id, identifier, or name, including its trackers and the custom fields enabled for its issues (with allowed values when visible). Call this before redmine_create_issue when a project may require custom fields.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
 			properties: {
-				id: { type: "string", description: "Numeric project id or string identifier" },
+				id: { type: "string", description: "Project id, identifier, or display name" },
 			},
 		},
 	},
@@ -1160,12 +1161,32 @@ async function handleTool(name, args) {
 		case "redmine_list_projects":
 			return ok(await redmineRequest("/projects.json", { query: args }));
 
-		case "redmine_get_project":
-			return ok(
-				await redmineRequest(
-					`/projects/${encodeURIComponent(await resolveProject(args.id))}.json`
-				)
+		case "redmine_get_project": {
+			const data = await redmineRequest(
+				`/projects/${encodeURIComponent(await resolveProject(args.id))}.json`,
+				{ query: { include: "trackers,issue_categories,issue_custom_fields" } }
 			);
+			const project = data?.project;
+			if (project?.issue_custom_fields?.length) {
+				// Enrich with the global definition (required flag, allowed values); the
+				// catalog is admin-only, so non-admin keys just get id + name.
+				const catalog = await customFieldCatalog();
+				project.issue_custom_fields = project.issue_custom_fields.map((f) => {
+					const def = catalog.find((c) => c.id === f.id);
+					return def
+						? {
+								id: f.id,
+								name: f.name,
+								format: def.field_format,
+								is_required: def.is_required,
+								possible_values: def.possible_values?.map((p) => p.value),
+								trackers: def.trackers?.map((t) => t.name),
+						  }
+						: f;
+				});
+			}
+			return ok(data);
+		}
 
 		case "redmine_list_issues": {
 			const { fetch_all, detail, ...filters } = args;
