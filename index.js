@@ -828,6 +828,41 @@ function toCustomFieldList(input, defs) {
 	return list.length ? list : undefined;
 }
 
+// Top-level keys the create/update tools understand as built-in issue fields.
+// Anything else is treated as a candidate custom-field name and auto-routed
+// into custom_fields, so a caller can set e.g. "Requested Due Date" directly
+// instead of mis-mapping it onto the built-in due_date.
+const BUILTIN_ISSUE_FIELDS = new Set([
+	"id", "project_id", "subject", "description", "notes", "private_notes",
+	"status_id", "priority_id", "assigned_to_id", "author_id", "tracker_id",
+	"category_id", "fixed_version_id", "parent_issue_id", "done_ratio",
+	"due_date", "start_date", "estimated_hours", "watcher_user_ids",
+	"custom_fields",
+]);
+
+// Move any top-level key that names a project custom field into custom_fields.
+// A named field wins over a built-in only when it is not itself a built-in key,
+// so "due_date" always stays the built-in "Due date" while "Requested Due Date"
+// (a custom field) is folded into custom_fields where it belongs.
+function routeNamedCustomFields(fields, defs) {
+	if (!defs?.length) return fields;
+	const byName = new Map(
+		defs.map((d) => [(d.name || "").trim().toLowerCase(), d]).filter(([n]) => n)
+	);
+	const out = { ...fields };
+	const cf = { ...(out.custom_fields || {}) };
+	let moved = false;
+	for (const key of Object.keys(out)) {
+		if (BUILTIN_ISSUE_FIELDS.has(key)) continue;
+		if (!byName.has(key.trim().toLowerCase())) continue;
+		cf[key] = out[key];
+		delete out[key];
+		moved = true;
+	}
+	if (moved) out.custom_fields = cf;
+	return out;
+}
+
 // When Redmine rejects a create because a project-required custom field is
 // blank, tell the caller exactly which field to pass (and its allowed values
 // when we can see them) so the retry can succeed without guessing.
@@ -964,15 +999,15 @@ const TOOLS = [
 				category_id: { type: "integer" },
 				fixed_version_id: { type: "integer" },
 				parent_issue_id: { type: "integer" },
-				start_date: { type: "string", description: "YYYY-MM-DD" },
-				due_date: { type: "string", description: "YYYY-MM-DD" },
+				start_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Start date' field ONLY." },
+				due_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Due date' field ONLY — do not use this for similarly named custom fields like 'Requested Due Date'; put those in custom_fields." },
 				estimated_hours: { type: "number" },
 				done_ratio: { type: "integer", minimum: 0, maximum: 100 },
 				watcher_user_ids: { type: "array", items: { type: "integer" } },
 				custom_fields: {
 					type: "object",
 					description:
-						"Custom field values keyed by field name or numeric id, e.g. {\"Is Billable (EH)?\": \"No\"}. Required by some projects.",
+						"Custom (project-specific) field values keyed by field name or numeric id, e.g. {\"Is Billable (EH)?\": \"No\", \"Requested Due Date\": \"2026-01-15\"}. Use this for ANY field that is not one of the built-in fields above (any named date, priority-like, or category-like field is a custom field). Required by some projects.",
 					additionalProperties: true,
 				},
 			},
@@ -998,13 +1033,13 @@ const TOOLS = [
 				category_id: { type: "integer" },
 				fixed_version_id: { type: "integer" },
 				done_ratio: { type: "integer", minimum: 0, maximum: 100 },
-				due_date: { type: "string" },
-				start_date: { type: "string" },
+				due_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Due date' field ONLY — do not use this for similarly named custom fields like 'Requested Due Date'; put those in custom_fields." },
+				start_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Start date' field ONLY." },
 				estimated_hours: { type: "number" },
 				custom_fields: {
 					type: "object",
 					description:
-						"Custom field values keyed by field name or numeric id, e.g. {\"Is Billable (EH)?\": \"No\"}.",
+						"Custom (project-specific) field values keyed by field name or numeric id, e.g. {\"Is Billable (EH)?\": \"No\", \"Requested Due Date\": \"2026-01-15\"}. Use this for ANY field that is not one of the built-in fields above (any named date, priority-like, or category-like field is a custom field).",
 					additionalProperties: true,
 				},
 			},
@@ -1230,11 +1265,14 @@ async function handleTool(name, args) {
 			if (issue.status_id) issue.status_id = await resolveStatus(issue.status_id);
 			if (issue.priority_id) issue.priority_id = await resolvePriority(issue.priority_id);
 			if (issue.assigned_to_id) issue.assigned_to_id = await resolveUser(issue.assigned_to_id);
-			if (issue.custom_fields) {
-				issue.custom_fields = toCustomFieldList(
-					issue.custom_fields,
-					await projectCustomFields(issue.project_id)
-				);
+			const hasNamedFields =
+				issue.custom_fields || Object.keys(issue).some((k) => !BUILTIN_ISSUE_FIELDS.has(k));
+			if (hasNamedFields) {
+				const defs = await projectCustomFields(issue.project_id);
+				const routed = routeNamedCustomFields(issue, defs);
+				for (const k of Object.keys(issue)) delete issue[k];
+				Object.assign(issue, routed);
+				if (issue.custom_fields) issue.custom_fields = toCustomFieldList(issue.custom_fields, defs);
 			}
 			let created;
 			try {
@@ -1256,18 +1294,27 @@ async function handleTool(name, args) {
 
 		case "redmine_update_issue": {
 			const { id, ...rest } = compactIssueFields(args);
-			if (rest.tracker_id) rest.tracker_id = await resolveTracker(rest.tracker_id);
-			if (rest.status_id) rest.status_id = await resolveStatus(rest.status_id);
-			if (rest.priority_id) rest.priority_id = await resolvePriority(rest.priority_id);
-			if (rest.assigned_to_id) rest.assigned_to_id = await resolveUser(rest.assigned_to_id);
-			if (rest.custom_fields) {
+			// If the caller passed custom_fields or any key we don't recognize as a
+			// built-in issue field (e.g. "Requested Due Date"), resolve them against
+			// this issue's project so named fields land in custom_fields, never on a
+			// same-sounding built-in like due_date.
+			const hasNamedFields =
+				rest.custom_fields || Object.keys(rest).some((k) => !BUILTIN_ISSUE_FIELDS.has(k));
+			if (hasNamedFields) {
 				const current = (await redmineRequest(`/issues/${id}.json`))?.issue;
 				const defs = [
 					...(current?.custom_fields || []),
 					...(current?.project?.id ? await projectCustomFields(current.project.id) : []),
 				];
-				rest.custom_fields = toCustomFieldList(rest.custom_fields, defs);
+				const routed = routeNamedCustomFields(rest, defs);
+				for (const k of Object.keys(rest)) delete rest[k];
+				Object.assign(rest, routed);
+				if (rest.custom_fields) rest.custom_fields = toCustomFieldList(rest.custom_fields, defs);
 			}
+			if (rest.tracker_id) rest.tracker_id = await resolveTracker(rest.tracker_id);
+			if (rest.status_id) rest.status_id = await resolveStatus(rest.status_id);
+			if (rest.priority_id) rest.priority_id = await resolvePriority(rest.priority_id);
+			if (rest.assigned_to_id) rest.assigned_to_id = await resolveUser(rest.assigned_to_id);
 			// Redmine's PUT returns 204 No Content, so re-read the issue to confirm
 			// the change actually landed rather than assuming success.
 			await redmineRequest(`/issues/${id}.json`, {
