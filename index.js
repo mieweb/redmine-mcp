@@ -56,12 +56,6 @@
  *                         the server refuses the call instead of silently acting
  *                         with full admin privileges. Set this only when you
  *                         intentionally want to operate as the admin account itself.
- *   REDMINE_DATE_FIELD_GUARD (optional) Guards against a model mis-mapping a custom
- *                         date field (e.g. "Requested Due Date") onto the built-in
- *                         due_date/start_date. One of: "off" (no check), "warn"
- *                         (default — apply but return a warnings note pointing at
- *                         the shadowing custom field) or "block" (refuse the write
- *                         and tell the caller how to target the custom field).
  *
  * User impersonation ("user assertion"):
  *   Any tool accepts an optional `on_behalf_of` argument (login or email). When the
@@ -96,18 +90,6 @@ const REDMINE_LOCK_ON_BEHALF_OF = /^(1|true|yes)$/i.test(
 const REDMINE_ALLOW_ADMIN = /^(1|true|yes)$/i.test(
 	(process.env.REDMINE_ALLOW_ADMIN || "").trim()
 );
-
-// How to handle the classic mis-route where a model puts a custom date (e.g.
-// "Requested Due Date") into the built-in due_date/start_date field:
-//   off   — no checking (legacy behaviour).
-//   warn  — apply the change but return a `warnings` note pointing at the
-//           shadowing custom field so the model/user can self-correct. Default.
-//   block — refuse the write and tell the caller exactly how to target the
-//           custom field, forcing a correct retry. Best for AI-only deployments.
-const DATE_FIELD_GUARD = (() => {
-	const v = (process.env.REDMINE_DATE_FIELD_GUARD || "warn").trim().toLowerCase();
-	return ["off", "warn", "block"].includes(v) ? v : "warn";
-})();
 
 const HTTP_PORT = Number(process.env.MCP_HTTP_PORT || process.env.PORT || 0);
 const HTTP_MODE = process.argv.includes("--http") || HTTP_PORT > 0;
@@ -881,60 +863,6 @@ function routeNamedCustomFields(fields, defs) {
 	return out;
 }
 
-// Human labels for the built-in date fields, used to spot custom fields whose
-// names shadow them (e.g. "Requested Due Date" shadows the built-in "Due date").
-const BUILTIN_DATE_LABELS = { due_date: "Due date", start_date: "Start date" };
-
-// Find project custom fields whose name embeds a built-in date label that the
-// caller is setting — the signature of the "Requested Due Date landed on the
-// built-in due_date" bug. `setCfIds` are custom-field ids the caller explicitly
-// set, which are therefore unambiguous and excluded. Deduped by id.
-function shadowingDateFields(setFields, defs, setCfIds = new Set()) {
-	const hits = new Map();
-	for (const [key, label] of Object.entries(BUILTIN_DATE_LABELS)) {
-		if (setFields[key] === undefined || setFields[key] === null) continue;
-		const needle = label.toLowerCase();
-		for (const d of defs || []) {
-			const name = (d.name || "").trim();
-			const lname = name.toLowerCase();
-			if (!name || lname === needle) continue; // the built-in itself
-			if (!lname.includes(needle)) continue; // not a look-alike
-			if (setCfIds.has(d.id) || hits.has(d.id)) continue;
-			hits.set(d.id, { builtin: key, label, id: d.id, name });
-		}
-	}
-	return [...hits.values()];
-}
-
-// Apply DATE_FIELD_GUARD to a prepared issue payload. Returns an array of
-// warning strings (empty when clear); throws in "block" mode to force a correct
-// retry. `fields.custom_fields` is expected in Redmine's [{id, value}] shape.
-function dateFieldGuard(fields, defs) {
-	if (DATE_FIELD_GUARD === "off") return [];
-	const setCfIds = new Set(
-		(Array.isArray(fields.custom_fields) ? fields.custom_fields : []).map((c) => c.id)
-	);
-	const shadows = shadowingDateFields(fields, defs, setCfIds);
-	if (!shadows.length) return [];
-	const retry = shadows
-		.map((s) => `custom field "${s.name}" (id ${s.id}) via custom_fields, dropping ${s.builtin}`)
-		.join("; ");
-	const detail = shadows
-		.map((s) => `set the built-in "${s.label}" but this project also has custom field "${s.name}" (id ${s.id})`)
-		.join("; ");
-	if (DATE_FIELD_GUARD === "block") {
-		throw new Error(
-			`Ambiguous date field: you ${detail}. If you meant the custom field, retry targeting ${retry}. ` +
-			`If you truly meant the built-in field, this deployment blocks it (REDMINE_DATE_FIELD_GUARD=block).`
-		);
-	}
-	return shadows.map(
-		(s) =>
-			`Changed the built-in "${s.label}". This project also has a custom field "${s.name}" (id ${s.id}); ` +
-			`if you meant that one, update it via custom_fields (e.g. {"${s.name}": "<YYYY-MM-DD>"}) and omit ${s.builtin}.`
-	);
-}
-
 // When Redmine rejects a create because a project-required custom field is
 // blank, tell the caller exactly which field to pass (and its allowed values
 // when we can see them) so the retry can succeed without guessing.
@@ -1337,21 +1265,15 @@ async function handleTool(name, args) {
 			if (issue.status_id) issue.status_id = await resolveStatus(issue.status_id);
 			if (issue.priority_id) issue.priority_id = await resolvePriority(issue.priority_id);
 			if (issue.assigned_to_id) issue.assigned_to_id = await resolveUser(issue.assigned_to_id);
-			const setsBuiltinDate =
-				issue.due_date !== undefined || issue.start_date !== undefined;
 			const hasNamedFields =
 				issue.custom_fields || Object.keys(issue).some((k) => !BUILTIN_ISSUE_FIELDS.has(k));
-			let defs = [];
-			if (hasNamedFields || (DATE_FIELD_GUARD !== "off" && setsBuiltinDate)) {
-				defs = await projectCustomFields(issue.project_id);
-			}
 			if (hasNamedFields) {
+				const defs = await projectCustomFields(issue.project_id);
 				const routed = routeNamedCustomFields(issue, defs);
 				for (const k of Object.keys(issue)) delete issue[k];
 				Object.assign(issue, routed);
 				if (issue.custom_fields) issue.custom_fields = toCustomFieldList(issue.custom_fields, defs);
 			}
-			const warnings = dateFieldGuard(issue, defs);
 			let created;
 			try {
 				created = await redmineRequest("/issues.json", {
@@ -1365,7 +1287,6 @@ async function handleTool(name, args) {
 			return ok({
 				ok: true,
 				id: newId,
-				...(warnings.length ? { warnings } : {}),
 				url: newId && REDMINE_URL ? `${REDMINE_URL}/issues/${newId}` : undefined,
 				issue: created?.issue ? summarizeIssue(created.issue) : null,
 			});
@@ -1373,31 +1294,23 @@ async function handleTool(name, args) {
 
 		case "redmine_update_issue": {
 			const { id, ...rest } = compactIssueFields(args);
-			// Fetch the issue (and its project's custom-field definitions) once when
-			// we either need to route named custom fields or run the date-field guard.
-			const setsBuiltinDate =
-				rest.due_date !== undefined || rest.start_date !== undefined;
+			// If the caller passed custom_fields or any key we don't recognize as a
+			// built-in issue field (e.g. "Requested Due Date"), resolve them against
+			// this issue's project so named fields land in custom_fields, never on a
+			// same-sounding built-in like due_date.
 			const hasNamedFields =
 				rest.custom_fields || Object.keys(rest).some((k) => !BUILTIN_ISSUE_FIELDS.has(k));
-			let defs = [];
-			if (hasNamedFields || (DATE_FIELD_GUARD !== "off" && setsBuiltinDate)) {
+			if (hasNamedFields) {
 				const current = (await redmineRequest(`/issues/${id}.json`))?.issue;
-				defs = [
+				const defs = [
 					...(current?.custom_fields || []),
 					...(current?.project?.id ? await projectCustomFields(current.project.id) : []),
 				];
-			}
-			// Route named custom fields (e.g. "Requested Due Date") into custom_fields
-			// so they never land on a same-sounding built-in like due_date.
-			if (hasNamedFields) {
 				const routed = routeNamedCustomFields(rest, defs);
 				for (const k of Object.keys(rest)) delete rest[k];
 				Object.assign(rest, routed);
 				if (rest.custom_fields) rest.custom_fields = toCustomFieldList(rest.custom_fields, defs);
 			}
-			// Guard: warn/block when a built-in date was set but the project also has
-			// a shadowing custom field the caller may have actually meant.
-			const warnings = dateFieldGuard(rest, defs);
 			if (rest.tracker_id) rest.tracker_id = await resolveTracker(rest.tracker_id);
 			if (rest.status_id) rest.status_id = await resolveStatus(rest.status_id);
 			if (rest.priority_id) rest.priority_id = await resolvePriority(rest.priority_id);
@@ -1413,7 +1326,6 @@ async function handleTool(name, args) {
 				ok: true,
 				id,
 				updated_fields: Object.keys(rest),
-				...(warnings.length ? { warnings } : {}),
 				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
 				issue: updated,
 			});
