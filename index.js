@@ -756,13 +756,35 @@ function issueListResult({ issues, total_count, limit, offset, detail }) {
 	};
 }
 
-// Re-read an issue and return its compact summary. Used after a write so the tool
-// reports the issue's ACTUAL state from Redmine instead of blindly claiming
-// success — a PUT returns 204 No Content, so without this a failed or no-op
-// update would still look like it worked.
-async function fetchIssueSummary(id) {
-	const data = await redmineRequest(`/issues/${id}.json`);
-	return data?.issue ? summarizeIssue(data.issue) : null;
+// Every custom field Redmine exposes on this issue (empty ones included) — these
+// are exactly the ids/names redmine_update_issue can set via custom_fields.
+function updatableCustomFields(issue) {
+	return (issue?.custom_fields || []).map((f) => ({
+		id: f.id,
+		name: (f.name || "").trim(),
+		value: f.value ?? "",
+		...(f.multiple ? { multiple: true } : {}),
+	}));
+}
+
+function sameFieldValue(a, b) {
+	const norm = (v) =>
+		Array.isArray(v) ? v.map(String).sort().join("\u0000") : String(v ?? "");
+	return norm(a) === norm(b);
+}
+
+// Redmine answers 204 even when it silently drops a custom field (not enabled for
+// the tracker, or read-only for this user by workflow) — detect that here.
+function customFieldsNotApplied(requested, after) {
+	const actual = new Map((after?.custom_fields || []).map((f) => [f.id, f]));
+	return (requested || [])
+		.filter((r) => !sameFieldValue(r.value, actual.get(r.id)?.value))
+		.map((r) => ({
+			id: r.id,
+			name: actual.get(r.id)?.name?.trim() ?? null,
+			requested: r.value,
+			actual: actual.has(r.id) ? actual.get(r.id).value : "(field not available on this issue)",
+		}));
 }
 
 // LLM clients fill optional fields with 0 / "" / null. Redmine treats an explicit
@@ -968,7 +990,7 @@ const TOOLS = [
 	{
 		name: "redmine_get_issue",
 		description:
-			`Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, and relations. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'. When referring the user to a ticket, link it as ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
+			`Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, relations, and 'updatable_custom_fields' (every custom field on the issue with id, name, and current value — empty ones included). Call this before redmine_update_issue to see which custom fields exist and what they're called. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'. When referring the user to a ticket, link it as ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -1016,7 +1038,7 @@ const TOOLS = [
 	{
 		name: "redmine_update_issue",
 		description:
-			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, edit the subject/description, set % done, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, and tracker. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
+			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, edit the subject/description, set % done, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, and tracker. Set custom fields (e.g. 'Requested Due Date') via 'custom_fields' — call redmine_get_issue first to see `updatable_custom_fields`. Any custom field Redmine silently refused is listed in `not_applied`. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -1253,9 +1275,8 @@ async function handleTool(name, args) {
 
 		case "redmine_get_issue": {
 			const include = args.include || "journals,attachments,children,relations,watchers";
-			return ok(
-				await redmineRequest(`/issues/${args.id}.json`, { query: { include } })
-			);
+			const data = await redmineRequest(`/issues/${args.id}.json`, { query: { include } });
+			return ok({ ...data, updatable_custom_fields: updatableCustomFields(data?.issue) });
 		}
 
 		case "redmine_create_issue": {
@@ -1294,6 +1315,7 @@ async function handleTool(name, args) {
 
 		case "redmine_update_issue": {
 			const { id, ...rest } = compactIssueFields(args);
+			const current = (await redmineRequest(`/issues/${id}.json`))?.issue;
 			// If the caller passed custom_fields or any key we don't recognize as a
 			// built-in issue field (e.g. "Requested Due Date"), resolve them against
 			// this issue's project so named fields land in custom_fields, never on a
@@ -1301,7 +1323,6 @@ async function handleTool(name, args) {
 			const hasNamedFields =
 				rest.custom_fields || Object.keys(rest).some((k) => !BUILTIN_ISSUE_FIELDS.has(k));
 			if (hasNamedFields) {
-				const current = (await redmineRequest(`/issues/${id}.json`))?.issue;
 				const defs = [
 					...(current?.custom_fields || []),
 					...(current?.project?.id ? await projectCustomFields(current.project.id) : []),
@@ -1321,13 +1342,16 @@ async function handleTool(name, args) {
 				method: "PUT",
 				body: { issue: rest },
 			});
-			const updated = await fetchIssueSummary(id);
+			const after = (await redmineRequest(`/issues/${id}.json`))?.issue;
+			const notApplied = customFieldsNotApplied(rest.custom_fields, after);
 			return ok({
-				ok: true,
+				ok: notApplied.length === 0,
 				id,
 				updated_fields: Object.keys(rest),
+				not_applied: notApplied.length ? notApplied : undefined,
 				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
-				issue: updated,
+				issue: after ? summarizeIssue(after) : null,
+				updatable_custom_fields: updatableCustomFields(after || current),
 			});
 		}
 
