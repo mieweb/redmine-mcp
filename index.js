@@ -885,6 +885,42 @@ function routeNamedCustomFields(fields, defs) {
 	return out;
 }
 
+// Resolve a caller's { name-or-id: value } map against an issue's OWN custom
+// fields — the only ones actually valid for its tracker. A field that exists on
+// the project but not on this issue (wrong tracker), or that does not exist at
+// all, is reported separately instead of being silently sent and dropped by
+// Redmine, which is the failure mode that makes custom-field writes look broken.
+function resolveCustomFieldsForIssue(input, issueDefs, projectDefs) {
+	const entries = Array.isArray(input)
+		? input.map((f) => [f.id ?? f.name, f.value])
+		: Object.entries(input || {});
+	const byId = new Map((issueDefs || []).map((d) => [d.id, d]));
+	const byName = new Map(
+		(issueDefs || []).map((d) => [(d.name || "").trim().toLowerCase(), d]).filter(([n]) => n)
+	);
+	const projById = new Map((projectDefs || []).map((d) => [d.id, d]));
+	const projByName = new Map(
+		(projectDefs || []).map((d) => [(d.name || "").trim().toLowerCase(), d]).filter(([n]) => n)
+	);
+	const resolved = [];
+	const unavailable = [];
+	const unknown = [];
+	for (const [key, value] of entries) {
+		if (value === undefined) continue;
+		const k = String(key).trim();
+		const isId = /^\d+$/.test(k);
+		const def = isId ? byId.get(Number(k)) : byName.get(k.toLowerCase());
+		if (def) {
+			resolved.push({ id: def.id, name: (def.name || "").trim(), value });
+			continue;
+		}
+		const proj = isId ? projById.get(Number(k)) : projByName.get(k.toLowerCase());
+		if (proj) unavailable.push({ id: proj.id, name: (proj.name || "").trim() });
+		else unknown.push(k);
+	}
+	return { resolved, unavailable, unknown };
+}
+
 // When Redmine rejects a create because a project-required custom field is
 // blank, tell the caller exactly which field to pass (and its allowed values
 // when we can see them) so the retry can succeed without guessing.
@@ -1062,6 +1098,24 @@ const TOOLS = [
 					type: "object",
 					description:
 						"Custom (project-specific) field values keyed by field name or numeric id, e.g. {\"Is Billable (EH)?\": \"No\", \"Requested Due Date\": \"2026-01-15\"}. Use this for ANY field that is not one of the built-in fields above (any named date, priority-like, or category-like field is a custom field).",
+					additionalProperties: true,
+				},
+			},
+		},
+	},
+	{
+		name: "redmine_set_custom_fields",
+		description:
+			"Set one or more custom field values on an issue/ticket reliably, and confirm they stuck. Pass 'fields' as a map of custom field name (or numeric id) to value, e.g. {\"Requested Due Date\": \"2026-01-15\", \"Is Billable (EH)?\": \"No\"}. It resolves names against the fields actually enabled for THIS issue's tracker, writes them, re-reads the issue to verify, and reports exactly what was 'applied', 'not_applied' (sent but rejected by Redmine — e.g. a value not in an allowed list), 'unavailable_on_tracker' (the field exists on the project but not for this issue's tracker) and 'unknown_fields'. It also returns 'available_custom_fields' listing the valid names/ids for the issue, so a failed name can be corrected. Prefer this over redmine_update_issue whenever the task is specifically to set custom fields.",
+		inputSchema: {
+			type: "object",
+			required: ["id", "fields"],
+			properties: {
+				id: { type: "integer", description: "Issue id" },
+				fields: {
+					type: "object",
+					description:
+						"Map of custom field name or numeric id to the value to set, e.g. {\"Requested Due Date\": \"2026-01-15\"}. For a multi-value field, pass an array of values.",
 					additionalProperties: true,
 				},
 			},
@@ -1352,6 +1406,77 @@ async function handleTool(name, args) {
 				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
 				issue: after ? summarizeIssue(after) : null,
 				updatable_custom_fields: updatableCustomFields(after || current),
+			});
+		}
+
+		case "redmine_set_custom_fields": {
+			const { id, fields } = args;
+			const empty =
+				!fields ||
+				(Array.isArray(fields) ? fields.length === 0 : Object.keys(fields).length === 0);
+			if (empty) {
+				return err(
+					"Provide 'fields' as a map of custom field name (or id) to value, e.g. {\"Requested Due Date\": \"2026-01-15\"}."
+				);
+			}
+			const current = (await redmineRequest(`/issues/${id}.json`))?.issue;
+			if (!current) return err(`Issue ${id} not found.`);
+			const issueDefs = current.custom_fields || [];
+			const projectDefs = current.project?.id
+				? await projectCustomFields(current.project.id)
+				: [];
+			const { resolved, unavailable, unknown } = resolveCustomFieldsForIssue(
+				fields,
+				issueDefs,
+				projectDefs
+			);
+			if (resolved.length) {
+				await redmineRequest(`/issues/${id}.json`, {
+					method: "PUT",
+					body: {
+						issue: { custom_fields: resolved.map((r) => ({ id: r.id, value: r.value })) },
+					},
+				});
+			}
+			const after = (await redmineRequest(`/issues/${id}.json`))?.issue;
+			const actual = new Map((after?.custom_fields || []).map((f) => [f.id, f]));
+			const applied = [];
+			const not_applied = [];
+			for (const r of resolved) {
+				if (sameFieldValue(r.value, actual.get(r.id)?.value)) {
+					applied.push({ id: r.id, name: r.name, value: actual.get(r.id)?.value ?? r.value });
+				} else {
+					not_applied.push({
+						id: r.id,
+						name: r.name,
+						requested: r.value,
+						actual: actual.has(r.id) ? actual.get(r.id).value : "(field not on issue)",
+					});
+				}
+			}
+			const tracker = current.tracker?.name ? ` (tracker "${current.tracker.name}")` : "";
+			const problems = [
+				...unknown.map((f) => `unknown custom field "${f}"`),
+				...unavailable.map((u) => `"${u.name}" exists on the project but is not enabled for this issue${tracker}`),
+				...not_applied.map(
+					(n) => `"${n.name}" was rejected by Redmine (requested ${JSON.stringify(n.requested)}, still ${JSON.stringify(n.actual)}) — check the value is one of the field's allowed options`
+				),
+			];
+			return ok({
+				ok: problems.length === 0,
+				id,
+				applied,
+				not_applied: not_applied.length ? not_applied : undefined,
+				unavailable_on_tracker: unavailable.length ? unavailable : undefined,
+				unknown_fields: unknown.length ? unknown : undefined,
+				hint: problems.length ? problems.join("; ") : undefined,
+				available_custom_fields: issueDefs.map((d) => ({
+					id: d.id,
+					name: (d.name || "").trim(),
+					value: d.value ?? "",
+					...(d.multiple ? { multiple: true } : {}),
+				})),
+				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
 			});
 		}
 
