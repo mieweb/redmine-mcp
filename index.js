@@ -1194,7 +1194,7 @@ const TOOLS = [
 	{
 		name: "redmine_create_time_entry",
 		description:
-			"Log time (hours worked) against an issue/ticket or a project. Use when the user says things like 'log 2 hours on ticket #123'. Provide either issue_id or project_id along with hours.",
+			"Log time (hours worked) against an issue/ticket or a project. Use when the user says things like 'log 2 hours on ticket #123'. Provide either issue_id or project_id along with hours. Some instances require a time-entry custom field such as a billable status; pass it via 'custom_fields'. Omit activity_id unless you have a real activity id (do not send 0).",
 		inputSchema: {
 			type: "object",
 			required: ["hours"],
@@ -1203,8 +1203,18 @@ const TOOLS = [
 				project_id: { type: "string" },
 				hours: { type: "number" },
 				spent_on: { type: "string", description: "YYYY-MM-DD (default: today)" },
-				activity_id: { type: "integer" },
+				activity_id: {
+					type: "integer",
+					description:
+						"Optional activity id. Only send a real, positive id; omit it (do not pass 0) to use the project's default activity.",
+				},
 				comments: { type: "string" },
+				custom_fields: {
+					type: "object",
+					additionalProperties: true,
+					description:
+						"Time-entry custom field values keyed by field name or numeric id, e.g. {\"Billable status\": \"Billable\"}. Required by some instances that make a billable status mandatory.",
+				},
 			},
 		},
 	},
@@ -1521,6 +1531,20 @@ async function handleTool(name, args) {
 		case "redmine_create_time_entry": {
 			const entry = { ...args };
 			if (entry.project_id) entry.project_id = await resolveProject(entry.project_id);
+			// activity_id 0 (or any non-positive value) is not a real activity and
+			// Redmine rejects it with "Activity is not included in the list"; drop it
+			// so the project's default activity is used.
+			if (!(Number.isInteger(entry.activity_id) && entry.activity_id > 0))
+				delete entry.activity_id;
+			// Some instances require a custom field on time entries (e.g. a
+			// "Billable status"); map any provided names/ids to the API shape.
+			if (entry.custom_fields) {
+				const defs = (await customFieldCatalog()).filter(
+					(d) => d.customized_type === "time_entry"
+				);
+				entry.custom_fields = toCustomFieldList(entry.custom_fields, defs);
+				if (!entry.custom_fields) delete entry.custom_fields;
+			}
 			return ok(
 				await redmineRequest("/time_entries.json", {
 					method: "POST",

@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it worked. `create` also returns the new id and a direct url. (#158273)
 
 ### Fixed
+- Time entries no longer fail on instances that require a billable status or
+  reject a `0` activity. `redmine_create_time_entry` now drops a non-positive
+  `activity_id` (so the project default is used instead of the invalid
+  "Activity is not included in the list") and accepts a `custom_fields` map
+  keyed by field name or id for mandatory time-entry fields such as a
+  "Billable status".
 - Issue creates from LLM clients no longer fail with a wall of unrelated 422 errors
   ("Priority cannot be blank", "Category is not included in the list", "Parent task
   is invalid", ...). Models routinely fill optional ids with `0`/`""`; those are now
