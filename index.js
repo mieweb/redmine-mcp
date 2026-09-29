@@ -757,7 +757,7 @@ function issueListResult({ issues, total_count, limit, offset, detail }) {
 }
 
 // Every custom field Redmine exposes on this issue (empty ones included) — these
-// are exactly the ids/names redmine_update_issue can set via custom_fields.
+// are exactly the ids/names update_issue can set via custom_fields.
 function updatableCustomFields(issue) {
 	return (issue?.custom_fields || []).map((f) => ({
 		id: f.id,
@@ -948,7 +948,7 @@ async function withCustomFieldHint(message, projectRef) {
 
 const TOOLS = [
 	{
-		name: "redmine_list_projects",
+		name: "list_projects",
 		description:
 			"List Redmine projects visible to the current user. Use this first when you need a project to create or search issues/tickets in and the user didn't specify one.",
 		inputSchema: {
@@ -960,9 +960,9 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_get_project",
+		name: "get_project",
 		description:
-			"Get details of a single Redmine project by id, identifier, or name, including its trackers and the custom fields enabled for its issues (with allowed values when visible). Call this before redmine_create_issue when a project may require custom fields.",
+			"Get details of a single Redmine project by id, identifier, or name, including its trackers and the custom fields enabled for its issues (with allowed values when visible). Call this before create_issue when a project may require custom fields.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -972,7 +972,7 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_list_issues",
+		name: "list_issues",
 		description:
 			"List or count issues (also called tickets, bugs, tasks, or problem reports) with optional filters. Use for questions like 'show my open tickets', 'what bugs are assigned to X', 'list issues in project Y', or 'how many tickets ...'. " +
 			"The result is a summary object: `total_count` is the TRUE number of matching issues in Redmine — always answer 'how many?' from `total_count`, never by counting the `issues` array, which is just one page. " +
@@ -980,7 +980,7 @@ const TOOLS = [
 			FETCH_ALL_CAP +
 			" issues). " +
 			"Filters accept friendly values, not just ids: assigned_to_id/author_id take a name, login, email, or 'me'; status_id takes 'open', 'closed', '*', or a status name; project_id takes an identifier or display name. " +
-			"To filter by WHEN an issue was opened/created/added, use created_on; by when it was last changed/modified/updated, use updated_on — both take a plain date like '2026-08-03', a 'from|to' range, or an operator like '>=2026-08-01'. For free-text search of issue contents, prefer redmine_search.",
+			"To filter by WHEN an issue was opened/created/added, use created_on; by when it was last changed/modified/updated, use updated_on — both take a plain date like '2026-08-03', a 'from|to' range, or an operator like '>=2026-08-01'. For free-text search of issue contents, prefer search.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1024,9 +1024,9 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_get_issue",
+		name: "get_issue",
 		description:
-			`Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, relations, and 'updatable_custom_fields' (every custom field on the issue with id, name, and current value — empty ones included). Call this before redmine_update_issue to see which custom fields exist and what they're called. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'. When referring the user to a ticket, link it as ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
+			`Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, relations, and 'updatable_custom_fields' (every custom field on the issue with id, name, and current value — empty ones included). Call this before update_issue to see which custom fields exist and what they're called. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'. When referring the user to a ticket, link it as ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -1040,9 +1040,9 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_create_issue",
+		name: "create_issue",
 		description:
-			`Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call redmine_list_projects first. Omit optional fields you don't have a real value for (never send 0 or "" as an id). Some projects require custom fields; if the create is rejected with '<field> cannot be blank', retry passing that field in 'custom_fields'. Returns the created issue's id, a direct url, and a summary so you can confirm it was created; show the user the new ticket as a link: ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
+			`Create a new issue — use this when the user wants to report a problem, file a bug, open a ticket, or add a task. Requires a project (id, identifier, or name) and a subject (short title). Put the detailed problem description in 'description'. If the project is unknown, call list_projects first. Omit optional fields you don't have a real value for (never send 0 or "" as an id). Some projects require custom fields; if the create is rejected with '<field> cannot be blank', retry passing that field in 'custom_fields'. Returns the created issue's id, a direct url, and a summary so you can confirm it was created; show the user the new ticket as a link: ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
 		inputSchema: {
 			type: "object",
 			required: ["project_id", "subject"],
@@ -1072,9 +1072,9 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_update_issue",
+		name: "update_issue",
 		description:
-			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, edit the subject/description, set % done, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, and tracker. Set custom fields (e.g. 'Requested Due Date') via 'custom_fields' — call redmine_get_issue first to see `updatable_custom_fields`. Any custom field Redmine silently refused is listed in `not_applied`. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
+			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, edit the subject/description, set % done, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, and tracker. Set custom fields (e.g. 'Requested Due Date') via 'custom_fields' — call get_issue first to see `updatable_custom_fields`. Any custom field Redmine silently refused is listed in `not_applied`. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -1104,9 +1104,9 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_set_custom_fields",
+		name: "set_custom_fields",
 		description:
-			"Set one or more custom field values on an issue/ticket reliably, and confirm they stuck. Pass 'fields' as a map of custom field name (or numeric id) to value, e.g. {\"Requested Due Date\": \"2026-01-15\", \"Is Billable (EH)?\": \"No\"}. It resolves names against the fields actually enabled for THIS issue's tracker, writes them, re-reads the issue to verify, and reports exactly what was 'applied', 'not_applied' (sent but rejected by Redmine — e.g. a value not in an allowed list), 'unavailable_on_tracker' (the field exists on the project but not for this issue's tracker) and 'unknown_fields'. It also returns 'available_custom_fields' listing the valid names/ids for the issue, so a failed name can be corrected. Prefer this over redmine_update_issue whenever the task is specifically to set custom fields.",
+			"Set one or more custom field values on an issue/ticket reliably, and confirm they stuck. Pass 'fields' as a map of custom field name (or numeric id) to value, e.g. {\"Requested Due Date\": \"2026-01-15\", \"Is Billable (EH)?\": \"No\"}. It resolves names against the fields actually enabled for THIS issue's tracker, writes them, re-reads the issue to verify, and reports exactly what was 'applied', 'not_applied' (sent but rejected by Redmine — e.g. a value not in an allowed list), 'unavailable_on_tracker' (the field exists on the project but not for this issue's tracker) and 'unknown_fields'. It also returns 'available_custom_fields' listing the valid names/ids for the issue, so a failed name can be corrected. Prefer this over update_issue whenever the task is specifically to set custom fields.",
 		inputSchema: {
 			type: "object",
 			required: ["id", "fields"],
@@ -1122,7 +1122,7 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_add_issue_note",
+		name: "add_issue_note",
 		description:
 			"Add a comment (also called a note or reply) to an existing issue/ticket. Use this when the user wants to respond on, comment on, or add information to a ticket without changing its other fields. On success it re-reads the issue and returns the recorded note (id and timestamp) so you can confirm it actually posted.",
 		inputSchema: {
@@ -1136,9 +1136,9 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_list_users",
+		name: "list_users",
 		description:
-			"Search or list Redmine user accounts, e.g. to find someone's id or login before assigning them a ticket. Requires an admin API key. For the current user, use redmine_current_user instead.",
+			"Search or list Redmine user accounts, e.g. to find someone's id or login before assigning them a ticket. Requires an admin API key. For the current user, use current_user instead.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -1150,15 +1150,15 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_current_user",
+		name: "current_user",
 		description:
 			"Get the currently authenticated Redmine user — answers 'who am I?' and is useful to confirm identity before filtering issues by 'me'.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
-		name: "redmine_search",
+		name: "search",
 		description:
-			"Full-text keyword search across Redmine (issues/tickets, wiki pages, news, documents). Use when looking for tickets by words in their text, e.g. 'find tickets mentioning the login page'. For structured filters (status, assignee, project), use redmine_list_issues instead.",
+			"Full-text keyword search across Redmine (issues/tickets, wiki pages, news, documents). Use when looking for tickets by words in their text, e.g. 'find tickets mentioning the login page'. For structured filters (status, assignee, project), use list_issues instead.",
 		inputSchema: {
 			type: "object",
 			required: ["q"],
@@ -1175,7 +1175,7 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_list_time_entries",
+		name: "list_time_entries",
 		description:
 			"List logged time (hours worked) with optional filters by user, project, issue/ticket, or date range. Use for questions like 'how many hours did I log this week'.",
 		inputSchema: {
@@ -1192,7 +1192,7 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_create_time_entry",
+		name: "create_time_entry",
 		description:
 			"Log time (hours worked) against an issue/ticket or a project. Use when the user says things like 'log 2 hours on ticket #123'. Provide either issue_id or project_id along with hours. Some instances require a time-entry custom field such as a billable status; pass it via 'custom_fields'. Omit activity_id unless you have a real activity id (do not send 0).",
 		inputSchema: {
@@ -1219,9 +1219,9 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_list_issue_attachments",
+		name: "list_issue_attachments",
 		description:
-			"List the files/screenshots attached to an issue/ticket (returns id, filename, content_type, filesize, content_url). Then use redmine_get_attachment with the id to view or download one.",
+			"List the files/screenshots attached to an issue/ticket (returns id, filename, content_type, filesize, content_url). Then use get_attachment with the id to view or download one.",
 		inputSchema: {
 			type: "object",
 			required: ["issue_id"],
@@ -1231,14 +1231,14 @@ const TOOLS = [
 		},
 	},
 	{
-		name: "redmine_get_attachment",
+		name: "get_attachment",
 		description:
-			"Download or view a file attached to an issue/ticket, by attachment id (get the id from redmine_get_issue or redmine_list_issue_attachments). Images (png/jpeg/gif/webp) are returned as viewable image content; other file types are returned as base64 plus metadata. Optionally also write the raw bytes to a local path via save_to.",
+			"Download or view a file attached to an issue/ticket, by attachment id (get the id from get_issue or list_issue_attachments). Images (png/jpeg/gif/webp) are returned as viewable image content; other file types are returned as base64 plus metadata. Optionally also write the raw bytes to a local path via save_to.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
 			properties: {
-				id: { type: "integer", description: "Attachment id (from redmine_list_issue_attachments or redmine_get_issue)" },
+				id: { type: "integer", description: "Attachment id (from list_issue_attachments or get_issue)" },
 				save_to: {
 					type: "string",
 					description: "Optional absolute or relative filesystem path to also write the raw bytes to.",
@@ -1279,10 +1279,10 @@ function toolsForRequest() {
 async function handleTool(name, args) {
 	args = args || {};
 	switch (name) {
-		case "redmine_list_projects":
+		case "list_projects":
 			return ok(await redmineRequest("/projects.json", { query: args }));
 
-		case "redmine_get_project": {
+		case "get_project": {
 			const data = await redmineRequest(
 				`/projects/${encodeURIComponent(await resolveProject(args.id))}.json`,
 				{ query: { include: "trackers,issue_categories,issue_custom_fields" } }
@@ -1309,7 +1309,7 @@ async function handleTool(name, args) {
 			return ok(data);
 		}
 
-		case "redmine_list_issues": {
+		case "list_issues": {
 			const { fetch_all, detail, ...filters } = args;
 			const query = { ...filters };
 			if (query.project_id) query.project_id = await resolveProject(query.project_id);
@@ -1337,13 +1337,13 @@ async function handleTool(name, args) {
 			);
 		}
 
-		case "redmine_get_issue": {
+		case "get_issue": {
 			const include = args.include || "journals,attachments,children,relations,watchers";
 			const data = await redmineRequest(`/issues/${args.id}.json`, { query: { include } });
 			return ok({ ...data, updatable_custom_fields: updatableCustomFields(data?.issue) });
 		}
 
-		case "redmine_create_issue": {
+		case "create_issue": {
 			const issue = compactIssueFields(args);
 			if (issue.project_id) issue.project_id = await resolveProject(issue.project_id);
 			if (issue.tracker_id) issue.tracker_id = await resolveTracker(issue.tracker_id);
@@ -1377,7 +1377,7 @@ async function handleTool(name, args) {
 			});
 		}
 
-		case "redmine_update_issue": {
+		case "update_issue": {
 			const { id, ...rest } = compactIssueFields(args);
 			const current = (await redmineRequest(`/issues/${id}.json`))?.issue;
 			// If the caller passed custom_fields or any key we don't recognize as a
@@ -1419,7 +1419,7 @@ async function handleTool(name, args) {
 			});
 		}
 
-		case "redmine_set_custom_fields": {
+		case "set_custom_fields": {
 			const { id, fields } = args;
 			const empty =
 				!fields ||
@@ -1490,7 +1490,7 @@ async function handleTool(name, args) {
 			});
 		}
 
-		case "redmine_add_issue_note": {
+		case "add_issue_note": {
 			const { id, notes, private_notes } = args;
 			await redmineRequest(`/issues/${id}.json`, {
 				method: "PUT",
@@ -1513,22 +1513,22 @@ async function handleTool(name, args) {
 			});
 		}
 
-		case "redmine_list_users":
+		case "list_users":
 			return ok(await redmineRequest("/users.json", { query: args }));
 
-		case "redmine_current_user":
+		case "current_user":
 			return ok(await redmineRequest("/users/current.json"));
 
-		case "redmine_search":
+		case "search":
 			return ok(await redmineRequest("/search.json", { query: args }));
 
-		case "redmine_list_time_entries": {
+		case "list_time_entries": {
 			const query = { ...args };
 			if (query.project_id) query.project_id = await resolveProject(query.project_id);
 			return ok(await redmineRequest("/time_entries.json", { query }));
 		}
 
-		case "redmine_create_time_entry": {
+		case "create_time_entry": {
 			const entry = { ...args };
 			if (entry.project_id) entry.project_id = await resolveProject(entry.project_id);
 			// activity_id 0 (or any non-positive value) is not a real activity and
@@ -1553,7 +1553,7 @@ async function handleTool(name, args) {
 			);
 		}
 
-		case "redmine_list_issue_attachments": {
+		case "list_issue_attachments": {
 			const data = await redmineRequest(`/issues/${args.issue_id}.json`, {
 				query: { include: "attachments" },
 			});
@@ -1570,7 +1570,7 @@ async function handleTool(name, args) {
 			return ok({ issue_id: args.issue_id, count: atts.length, attachments: atts });
 		}
 
-		case "redmine_get_attachment": {
+		case "get_attachment": {
 			const meta = await redmineRequest(`/attachments/${args.id}.json`);
 			const att = meta?.attachment;
 			if (!att) throw new Error(`Attachment ${args.id} not found`);
@@ -1636,13 +1636,13 @@ function createMcpServer() {
 			instructions: [
 				"This server connects to Redmine, a project management and issue tracking system.",
 				"Terminology: an 'issue' is the same thing as a ticket, bug, task, defect, feature request, or problem report. When the user says 'ticket', 'bug', 'task', or wants to 'report a problem', use the issue tools.",
-				"To report a problem or file a ticket: use redmine_create_issue (needs a project and a subject). If you don't know the project, call redmine_list_projects first and pick the best match or ask the user.",
-				"To find existing issues/tickets: use redmine_list_issues for filtered lists (by project, assignee, status, etc.) or redmine_search for free-text search. Use redmine_get_issue to read one issue in full, including its comment history.",
-				"Mapping everyday words to redmine_list_issues filters: 'created/opened/added/filed/reported/new since <date>' -> created_on; 'updated/modified/changed/edited/touched since <date>' -> updated_on; 'assigned to <person/me>' -> assigned_to_id; 'reported/opened by <person>' -> author_id; 'in <project>' -> project_id; 'of type/tracker <bug/feature>' -> tracker_id; '<priority>' -> priority_id; 'category' -> category_id; '% done/progress' -> done_ratio; 'open/closed' -> status_id. Dates take a plain 'YYYY-MM-DD' (a whole day), a 'from|to' range, or an operator like '>=YYYY-MM-DD'.",
+				"To report a problem or file a ticket: use create_issue (needs a project and a subject). If you don't know the project, call list_projects first and pick the best match or ask the user.",
+				"To find existing issues/tickets: use list_issues for filtered lists (by project, assignee, status, etc.) or search for free-text search. Use get_issue to read one issue in full, including its comment history.",
+				"Mapping everyday words to list_issues filters: 'created/opened/added/filed/reported/new since <date>' -> created_on; 'updated/modified/changed/edited/touched since <date>' -> updated_on; 'assigned to <person/me>' -> assigned_to_id; 'reported/opened by <person>' -> author_id; 'in <project>' -> project_id; 'of type/tracker <bug/feature>' -> tracker_id; '<priority>' -> priority_id; 'category' -> category_id; '% done/progress' -> done_ratio; 'open/closed' -> status_id. Dates take a plain 'YYYY-MM-DD' (a whole day), a 'from|to' range, or an operator like '>=YYYY-MM-DD'.",
 				"For counts ('how many ...') read total_count from the result, never the length of the issues array; for a complete list across pages pass fetch_all: true.",
-				"To comment on a ticket: use redmine_add_issue_note. To change status, assignee, priority, or other fields: use redmine_update_issue.",
+				"To comment on a ticket: use add_issue_note. To change status, assignee, priority, or other fields: use update_issue.",
 				"Most filter fields accept human-friendly values: names, logins, emails, or 'me' — you do not need numeric ids.",
-				"To log hours worked: use redmine_create_time_entry. To see who the current user is: redmine_current_user.",
+				"To log hours worked: use create_time_entry. To see who the current user is: current_user.",
 				`Deep links: whenever you mention an issue/ticket to the user, include a clickable link of the form ${REDMINE_URL || "<redmine-url>"}/issues/<id> (e.g. after creating or finding a ticket). Link a project as ${REDMINE_URL || "<redmine-url>"}/projects/<identifier>, and a specific comment as ${REDMINE_URL || "<redmine-url>"}/issues/<id>#note-<n>.`,
 			].join("\n"),
 		}

@@ -14,7 +14,7 @@ body:
     attributes:
       label: Steps to reproduce
       placeholder: |
-        1. Call tool `redmine_list_issues` with `{...}`
+        1. Call tool `list_issues` with `{...}`
         2. ...
     validations:
       required: true

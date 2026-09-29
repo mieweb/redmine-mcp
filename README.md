@@ -27,20 +27,20 @@ Ask your editor's AI to *"summarize Redmine #12345"*, *"list my open tickets"*, 
 
 | Tool | Description |
 | --- | --- |
-| `redmine_current_user` | Return the user that owns the API key (useful for sanity checks) |
-| `redmine_list_projects` | List visible projects |
-| `redmine_get_project` | Get one project by id or identifier |
-| `redmine_list_issues` | Search/filter issues (project, assignee, status, sort, …) |
-| `redmine_get_issue` | Fetch one issue with journals, attachments, children, relations |
-| `redmine_create_issue` | Create a new issue |
-| `redmine_update_issue` | Update any field on an existing issue |
-| `redmine_add_issue_note` | Add a comment (journal note), optionally private |
-| `redmine_list_users` | List users (admin) or filter by name/status |
-| `redmine_search` | Full-text search across issues, wiki, news, documents |
-| `redmine_list_time_entries` | List time entries with filters |
-| `redmine_create_time_entry` | Log time against an issue or project |
-| `redmine_list_issue_attachments` | List attachments on an issue (id, filename, content-type, size) |
-| `redmine_get_attachment` | Download an attachment by id — **images are returned inline as MCP image content** so the model can view them; other files are returned as base64 and optionally written to disk via `save_to` |
+| `current_user` | Return the user that owns the API key (useful for sanity checks) |
+| `list_projects` | List visible projects |
+| `get_project` | Get one project by id or identifier |
+| `list_issues` | Search/filter issues (project, assignee, status, sort, …) |
+| `get_issue` | Fetch one issue with journals, attachments, children, relations |
+| `create_issue` | Create a new issue |
+| `update_issue` | Update any field on an existing issue |
+| `add_issue_note` | Add a comment (journal note), optionally private |
+| `list_users` | List users (admin) or filter by name/status |
+| `search` | Full-text search across issues, wiki, news, documents |
+| `list_time_entries` | List time entries with filters |
+| `create_time_entry` | Log time against an issue or project |
+| `list_issue_attachments` | List attachments on an issue (id, filename, content-type, size) |
+| `get_attachment` | Download an attachment by id — **images are returned inline as MCP image content** so the model can view them; other files are returned as base64 and optionally written to disk via `save_to` |
 
 ## 🚀 Installation
 
