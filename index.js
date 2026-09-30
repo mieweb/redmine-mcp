@@ -304,6 +304,12 @@ async function redmineRequest(path, { method = "GET", query, body, rawBody } = {
 				`Redmine ${method} ${url.pathname} rejected (${res.status}): ${json.errors.join("; ")}. Fix the value(s) named above and retry.`
 			);
 		}
+		// An empty error list usually means another update to the same issue landed concurrently.
+		if (res.status === 422 && Array.isArray(json?.errors)) {
+			throw new Error(
+				`Redmine ${method} ${url.pathname} rejected (422) without a reason — usually another change to the same ticket happened at the same moment. Retry this call on its own.`
+			);
+		}
 		throw new Error(
 			`Redmine ${method} ${url.pathname} failed: ${res.status} ${res.statusText} - ${text.slice(0, 500)}`
 		);
@@ -1762,6 +1768,9 @@ async function handleTool(name, args) {
 			const { tags, ...fields } = args;
 			const issue = compactIssueFields(fields);
 			if (issue.project_id) issue.project_id = await resolveProject(issue.project_id);
+			if (!(await projectByRef(issue.project_id))) {
+				return err(`Unknown project '${args.project_id}'. Use list_projects to find its name or identifier.`);
+			}
 			if (issue.tracker_id) issue.tracker_id = await resolveTracker(issue.tracker_id);
 			if (issue.status_id) issue.status_id = await resolveStatus(issue.status_id);
 			if (issue.priority_id) issue.priority_id = await resolvePriority(issue.priority_id);
@@ -1998,12 +2007,7 @@ async function handleTool(name, args) {
 				unavailable_on_tracker: unavailable.length ? unavailable : undefined,
 				unknown_fields: unknown.length ? unknown : undefined,
 				hint: problems.length ? problems.join("; ") : undefined,
-				available_custom_fields: issueDefs.map((d) => ({
-					id: d.id,
-					name: (d.name || "").trim(),
-					value: d.value ?? "",
-					...(d.multiple ? { multiple: true } : {}),
-				})),
+				available_custom_fields: updatableCustomFields(after || current),
 				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
 			});
 		}
@@ -2064,7 +2068,8 @@ async function handleTool(name, args) {
 				query: { include: "journals" },
 			});
 			const journals = data?.issue?.journals || [];
-			const lastNote = [...journals].reverse().find((j) => j.notes);
+			// Journal order varies by user preference, so pick the newest by id.
+			const lastNote = journals.filter((j) => j.notes).sort((a, b) => b.id - a.id)[0];
 			return ok({
 				ok: true,
 				id,
@@ -2078,11 +2083,20 @@ async function handleTool(name, args) {
 		case "list_users":
 			return ok(await redmineRequest("/users.json", { query: args }));
 
-		case "current_user":
-			return ok(await redmineRequest("/users/current.json"));
+		case "current_user": {
+			const data = await redmineRequest("/users/current.json");
+			// Never hand the credential to the model.
+			if (data?.user) delete data.user.api_key;
+			return ok(data);
+		}
 
-		case "search":
-			return ok(await redmineRequest("/search.json", { query: args }));
+		case "search": {
+			const data = await redmineRequest("/search.json", { query: args });
+			for (const r of data?.results || []) {
+				if (r.description?.length > 300) r.description = `${r.description.slice(0, 300)}…`;
+			}
+			return ok(data);
+		}
 
 		case "list_time_entries": {
 			const query = { ...args };
@@ -2216,6 +2230,9 @@ async function handleTool(name, args) {
 				};
 			}
 
+			if (/^text\/|json|xml|csv|yaml/i.test(info.content_type || "")) {
+				return ok({ ...info, text: buffer.toString("utf8"), inlined: true });
+			}
 			return ok({ ...info, base64, inlined: true });
 		}
 

@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it worked. `create` also returns the new id and a direct url. (#158273)
 
 ### Fixed
+- **Security:** `current_user` no longer returns the caller's Redmine API key.
+- `add_issue_note` confirmed the wrong (oldest) note on instances that list
+  history newest-first; it now picks the newest journal by id.
+- `create_issue` with an unknown project reports it, instead of Redmine's
+  misleading "Project/Tracker/Status cannot be blank".
+- `search` truncates result descriptions to 300 characters (one match returned 43 KB).
+- `get_attachment` returns text files (text, JSON, XML, CSV) as readable text, not base64.
+- `set_custom_fields` lists the fields' values after the write, not before.
+- A 422 with no reason (concurrent update to the same issue) now says to retry.
 - Time entries must be in quarter hours (0.25, 0.5, 0.75, 2.25, ...). Other
   values are rejected before anything is saved, with the nearest valid amount
   suggested; `h:mm` input such as `1:15` is accepted.
