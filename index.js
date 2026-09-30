@@ -279,12 +279,22 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 				`Redmine impersonation failed: user '${switchUser}' does not exist or is not active (X-Redmine-Switch-User returned 412).`
 			);
 		}
+		if (res.status === 404) {
+			throw new Error(
+				`Redmine ${method} ${url.pathname}: not found (404) — the id/name does not exist or is not visible to this user. ${notFoundHint(path)}`
+			);
+		}
+		if (res.status === 403) {
+			throw new Error(
+				`Redmine ${method} ${url.pathname}: permission denied (403) — this user is not allowed to do that. Do not retry with the same arguments.`
+			);
+		}
 		// Redmine reports validation problems (422) as { errors: [...] }. Surface
 		// them verbatim so the caller sees *why* a write was rejected instead of a
 		// generic status code — e.g. "Subject cannot be blank".
 		if (Array.isArray(json?.errors) && json.errors.length) {
 			throw new Error(
-				`Redmine ${method} ${url.pathname} rejected (${res.status}): ${json.errors.join("; ")}`
+				`Redmine ${method} ${url.pathname} rejected (${res.status}): ${json.errors.join("; ")}. Fix the value(s) named above and retry.`
 			);
 		}
 		throw new Error(
@@ -292,6 +302,13 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 		);
 	}
 	return json;
+}
+
+function notFoundHint(path) {
+	if (path.startsWith("/issues/")) return "Find the correct issue id with list_issues or search.";
+	if (path.startsWith("/projects/")) return "Use list_projects to find a valid project identifier.";
+	if (path.startsWith("/attachments/")) return "Use list_issue_attachments to get valid attachment ids.";
+	return "";
 }
 
 async function redmineDownload(absoluteUrl) {
@@ -539,7 +556,7 @@ function matchByName(items, value, kind) {
 	}
 	if (match?.id == null) {
 		throw new Error(
-			`Unknown ${kind} '${value}'. Valid values: ${items.map((it) => `"${(it.name || "").trim()}"`).join(", ")}`
+			`Unknown ${kind} '${value}'. Valid values: ${items.map((it) => `"${(it.name || "").trim()}"`).join(", ")}. Retry with one of these.`
 		);
 	}
 	return String(match.id);
@@ -1624,7 +1641,49 @@ async function handleTool(name, args) {
 		}
 
 		default:
-			return err(`Unknown tool: ${name}`);
+			return err(`Unknown tool: ${name}. Available tools: ${TOOLS.map((t) => t.name).join(", ")}`);
+	}
+}
+
+// Tools were renamed without the "redmine_" prefix; keep old names working for
+// clients with a cached tool list.
+function canonicalToolName(name) {
+	if (TOOLS.some((t) => t.name === name)) return name;
+	return String(name || "").replace(/^redmine_/, "");
+}
+
+// Coerce loosely typed model input to the schema ("#1234" -> 1234, "true" -> true),
+// drop empty values, and fail early with a clear message on bad or missing args.
+function normalizeArgs(name, args) {
+	const schema = TOOLS.find((t) => t.name === name)?.inputSchema;
+	if (!schema) return;
+	const props = schema.properties || {};
+	for (const [key, value] of Object.entries(args)) {
+		if (value === null || value === "") {
+			delete args[key];
+			continue;
+		}
+		if (typeof value !== "string") continue;
+		const raw = value.trim();
+		const type = props[key]?.type;
+		if (type === "integer") {
+			const digits = raw.replace(/^#/, "");
+			if (!/^-?\d+$/.test(digits)) {
+				throw new Error(`Argument '${key}' must be a whole number like 1234 (got ${JSON.stringify(value)}).`);
+			}
+			args[key] = Number(digits);
+		} else if (type === "number") {
+			if (!/^-?(\d+\.?\d*|\.\d+)$/.test(raw)) {
+				throw new Error(`Argument '${key}' must be a number like 1.5 (got ${JSON.stringify(value)}).`);
+			}
+			args[key] = Number(raw);
+		} else if (type === "boolean" && /^(true|false)$/i.test(raw)) {
+			args[key] = raw.toLowerCase() === "true";
+		}
+	}
+	const missing = (schema.required || []).filter((k) => args[k] === undefined);
+	if (missing.length) {
+		throw new Error(`Missing required argument(s) for ${name}: ${missing.join(", ")}.`);
 	}
 }
 
@@ -1695,6 +1754,8 @@ async function dispatchToolCall(name, args, audit) {
 	const identity =
 		pinned || (REDMINE_LOCK_ON_BEHALF_OF ? "" : args.on_behalf_of) || REDMINE_ON_BEHALF_OF || "";
 	delete args.on_behalf_of;
+	name = canonicalToolName(name);
+	normalizeArgs(name, args);
 
 	if (identity) {
 		if (await ensureAdmin()) {

@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it worked. `create` also returns the new id and a direct url. (#158273)
 
 ### Fixed
+- More reliable tool calls from LLM clients. Arguments are coerced to their schema
+  type (`"#1234"` → `1234`, `"1.5"` → `1.5`, `"true"` → `true`), empty values are
+  dropped, and missing/invalid arguments fail early with a clear message. 404/403/422
+  errors now say what to do next (e.g. "find the correct issue id with list_issues"),
+  unknown tool calls list the available tools, and legacy `redmine_*` tool names
+  still resolve after the rename.
 - Time entries no longer fail on instances that require a billable status or
   reject a `0` activity. `redmine_create_time_entry` now drops a non-positive
   `activity_id` (so the project default is used instead of the invalid
