@@ -33,8 +33,9 @@ Ask your editor's AI to *"summarize Redmine #12345"*, *"list my open tickets"*, 
 | `list_issues` | Search/filter issues (project, assignee, status, tags, sort, …) |
 | `get_issue` | Fetch one issue with journals, attachments, children, relations, watchers, tags, checklist, story points, and allowed next statuses |
 | `create_issue` | Create a new issue |
-| `update_issue` | Update any field on an existing issue, including tags, story points, watchers, target version, parent, and private flag |
+| `update_issue` | Update any field on an existing issue, including tags, story points, watchers, relations, target version, parent, and private flag; empty fields via `clear` |
 | `update_checklist` | Add, check, uncheck, or remove checklist items |
+| `attach_file` | Attach a file (text, base64, or a local path in stdio mode) to an issue |
 | `add_issue_note` | Add a comment (journal note), optionally private |
 | `list_users` | List users (admin) or filter by name/status |
 | `search` | Full-text search across issues, wiki, news, documents |

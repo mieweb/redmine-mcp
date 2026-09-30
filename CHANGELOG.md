@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   points, watchers (add/remove by name), target version by name, parent task,
   private flag, and `allowed_statuses` in `get_issue`. New `update_checklist` tool
   for the Checklists plugin.
+- `update_issue` can empty fields (`clear: ["target version", "Requested Due Date"]`)
+  and link/unlink related tickets (`add_relations`, `remove_relations`).
+- `attach_file` tool uploads a file to an issue. Local file paths are only
+  accepted in stdio mode, so an HTTP deployment cannot be used to read server files.
+- Tickets can never be deleted through this server: any DELETE on an issue is
+  refused before it reaches Redmine (close or reject the ticket instead).
+- Custom field value suggestions for non-admin keys: `get_project` returns
+  `recent_values` per field, and a rejected value lists the valid choices.
 - Verifiable writes. `redmine_update_issue`, `redmine_create_issue`, and
   `redmine_add_issue_note` now re-read from Redmine after writing and return the
   resulting issue (or the recorded note), instead of assuming success — a PUT

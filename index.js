@@ -240,9 +240,13 @@ function authHeaders(extra) {
 	return headers;
 }
 
-async function redmineRequest(path, { method = "GET", query, body } = {}) {
+async function redmineRequest(path, { method = "GET", query, body, rawBody } = {}) {
 	if (!REDMINE_URL) throw new Error("REDMINE_URL is not configured");
 	if (!currentApiKey()) throw new Error(MISSING_KEY_MESSAGE);
+	// Policy: this server must never delete tickets.
+	if (method.toUpperCase() === "DELETE" && /^\/issues\/[^/]+?(\.json)?(\?|$)/.test(path)) {
+		throw new Error("Deleting issues/tickets is not permitted through this server. Close or reject the ticket instead (update_issue status_id).");
+	}
 
 	const url = new URL(REDMINE_URL + path);
 	if (query && typeof query === "object") {
@@ -262,6 +266,9 @@ async function redmineRequest(path, { method = "GET", query, body } = {}) {
 	if (body !== undefined) {
 		headers["Content-Type"] = "application/json";
 		init.body = JSON.stringify(body);
+	} else if (rawBody !== undefined) {
+		headers["Content-Type"] = "application/octet-stream";
+		init.body = rawBody;
 	}
 
 	const res = await fetch(url, init);
@@ -951,6 +958,54 @@ async function customFieldCatalog() {
 	});
 }
 
+// Custom field id -> allowed values. Non-admin keys cannot read definitions, so
+// fall back to values recently used on the project's issues (list-like fields only).
+async function customFieldValues(projectRef) {
+	const catalog = await customFieldCatalog();
+	if (catalog.length) {
+		return new Map(
+			catalog.filter((c) => c.possible_values?.length).map((c) => [c.id, c.possible_values.map((p) => p.value)])
+		);
+	}
+	return loadRef(`cfvals:${projectRef}`, async () => {
+		const data = await tryOr(() =>
+			redmineRequest("/issues.json", {
+				query: { project_id: projectRef, status_id: "*", sort: "updated_on:desc", limit: PAGE_SIZE },
+			})
+		);
+		const byId = new Map();
+		for (const issue of data?.issues || []) {
+			for (const f of issue.custom_fields || []) {
+				if (!byId.has(f.id)) byId.set(f.id, new Set());
+				for (const v of [].concat(f.value ?? [])) if (v !== "") byId.get(f.id).add(String(v));
+			}
+		}
+		return new Map(
+			[...byId]
+				.filter(([, s]) => s.size && s.size <= 40)
+				// Dates and user ids are not choices worth suggesting.
+				.filter(([, s]) => ![...s].every((v) => /^\d+$|^\d{4}-\d{2}-\d{2}$/.test(v)))
+				.map(([id, s]) => [id, [...s].sort()])
+		);
+	});
+}
+
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Append allowed values for the custom fields named in a Redmine validation error.
+async function withFieldValuesHint(message, fields, projectRef) {
+	const lower = message.toLowerCase();
+	const named = (fields || []).filter((f) =>
+		new RegExp(`${escapeRegExp((f.name || "").trim().toLowerCase())}\\s+(is not included|cannot be blank|is invalid)`).test(lower)
+	);
+	if (!named.length) return message;
+	const allowed = await customFieldValues(projectRef);
+	const hints = named
+		.filter((f) => allowed.get(f.id))
+		.map((f) => `"${f.name.trim()}" (e.g. one of: ${allowed.get(f.id).join(", ")})`);
+	return hints.length ? `${message} Valid values for ${hints.join("; ")}.` : message;
+}
+
 // Turn { "Is Billable (EH)?": "No" } / { "49": "No" } (or Redmine's own
 // [{ id, value }] array) into the [{ id, value }] list the API expects, mapping
 // names to ids case-insensitively against `defs`.
@@ -988,7 +1043,51 @@ const BUILTIN_ISSUE_FIELDS = new Set([
 ]);
 
 // update_issue arguments handled by separate API calls, never sent in the PUT body.
-const ISSUE_EXTRA_ARGS = ["tags", "add_tags", "remove_tags", "story_points", "add_watchers", "remove_watchers"];
+const ISSUE_EXTRA_ARGS = ["tags", "add_tags", "remove_tags", "story_points", "add_watchers", "remove_watchers", "clear", "add_relations", "remove_relations"];
+
+// Built-in fields update_issue can empty via `clear`, with the names people use for them.
+const CLEARABLE_FIELDS = {
+	assigned_to_id: ["assignee", "assigned to"],
+	fixed_version_id: ["target version", "version"],
+	parent_issue_id: ["parent", "parent task", "parent issue"],
+	category_id: ["category"],
+	start_date: ["start date"],
+	due_date: ["due date"],
+	estimated_hours: ["estimated time", "estimated hours", "estimate"],
+	description: [],
+};
+
+function applyClear(rest, field, current) {
+	const key = String(field).trim();
+	const lower = key.toLowerCase();
+	const builtin = Object.entries(CLEARABLE_FIELDS).find(([k, aliases]) => k === lower || aliases.includes(lower));
+	if (builtin) {
+		rest[builtin[0]] = "";
+	} else if (lower === "tags") {
+		rest.tag_list = [""];
+	} else if (lower === "story points" || lower === "story_points") {
+		rest.agile_data_attributes = { story_points: "" };
+	} else {
+		const cf = (current?.custom_fields || []).find((f) => String(f.id) === key || f.name.trim().toLowerCase() === lower);
+		if (!cf) {
+			const names = [...Object.keys(CLEARABLE_FIELDS), "tags", "story_points", ...(current?.custom_fields || []).map((f) => f.name.trim())];
+			throw new Error(`Cannot clear '${field}'. Clearable fields: ${names.join(", ")}`);
+		}
+		rest.custom_fields = [...(rest.custom_fields || []), { id: cf.id, value: cf.multiple ? [""] : "" }];
+	}
+}
+
+const RELATION_TYPES = ["relates", "duplicates", "duplicated", "blocks", "blocked", "precedes", "follows", "copied_to", "copied_from"];
+
+function relationType(value) {
+	const t = String(value || "relates").trim().toLowerCase().replace(/\s+by$/, "").replace(/\s+/g, "_");
+	if (!RELATION_TYPES.includes(t)) {
+		throw new Error(`Unknown relation type '${value}'. Valid: ${RELATION_TYPES.join(", ")}`);
+	}
+	return t;
+}
+
+const issueNumber = (v) => Number(String(v).trim().replace(/^#/, ""));
 
 // Move any top-level key that names a project custom field into custom_fields.
 // A named field wins over a built-in only when it is not itself a built-in key,
@@ -1126,10 +1225,10 @@ async function withCustomFieldHint(message, projectRef) {
 		lower.includes(`${d.name.trim().toLowerCase()} cannot be blank`)
 	);
 	if (!missing.length) return message;
-	const catalog = await customFieldCatalog();
+	const allowed = await customFieldValues(projectRef);
 	const describe = (d) => {
-		const values = catalog.find((c) => c.id === d.id)?.possible_values?.map((p) => p.value);
-		return `"${d.name.trim()}"${values?.length ? ` (one of: ${values.join(", ")})` : ""}`;
+		const values = allowed.get(d.id);
+		return `"${d.name.trim()}"${values?.length ? ` (e.g. one of: ${values.join(", ")})` : ""}`;
 	};
 	const example = missing.map((d) => `"${d.name.trim()}": "<value>"`).join(", ");
 	return `${message}. This project requires custom field(s) ${missing.map(describe).join(", ")}. Retry with custom_fields, e.g. "custom_fields": {${example}}`;
@@ -1270,7 +1369,7 @@ const TOOLS = [
 	{
 		name: "update_issue",
 		description:
-			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, target version, parent, private flag, edit the subject/description, set % done or story points, change tags, add/remove watchers, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, tracker, target version and watchers. Use add_tags/remove_tags to change tags without touching the others. Set custom fields (e.g. 'Requested Due Date') via 'custom_fields' — call get_issue first to see `updatable_custom_fields` and `allowed_statuses`. Any custom field Redmine silently refused is listed in `not_applied`. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
+			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, target version, parent, private flag, edit the subject/description, set % done or story points, change tags, add/remove watchers, link or unlink related tickets, empty fields via 'clear', or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, tracker, target version and watchers. Use add_tags/remove_tags to change tags without touching the others. Set custom fields (e.g. 'Requested Due Date') via 'custom_fields' — call get_issue first to see `updatable_custom_fields` and `allowed_statuses`. Any custom field Redmine silently refused is listed in `not_applied`. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -1294,6 +1393,29 @@ const TOOLS = [
 				story_points: { type: "number", description: "Agile story points" },
 				add_watchers: { type: "array", items: { type: "string" }, description: "People to add as watchers (name, login, id, or 'me')" },
 				remove_watchers: { type: "array", items: { type: "string" }, description: "Watchers to remove (name, login, id, or 'me')" },
+				clear: {
+					type: "array",
+					items: { type: "string" },
+					description: "Fields to empty, by name, e.g. ['target version', 'due date', 'Requested Due Date', 'tags']. Works for assignee, target version, parent, category, start/due date, estimated time, description, tags, story points, and any custom field.",
+				},
+				add_relations: {
+					type: "array",
+					description: "Link this ticket to others, e.g. [{\"issue_id\": 1234, \"type\": \"blocks\"}]",
+					items: {
+						type: "object",
+						required: ["issue_id"],
+						properties: {
+							issue_id: { type: "integer", description: "The other ticket" },
+							type: { type: "string", enum: RELATION_TYPES, description: "Default 'relates'. 'blocked' = this ticket is blocked by the other." },
+							delay: { type: "integer", description: "Days, for precedes/follows only" },
+						},
+					},
+				},
+				remove_relations: {
+					type: "array",
+					items: { type: "string" },
+					description: "Relations to remove, by relation id or the other ticket's id",
+				},
 				done_ratio: { type: "integer", minimum: 0, maximum: 100 },
 				due_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Due date' field ONLY — do not use this for similarly named custom fields like 'Requested Due Date'; put those in custom_fields." },
 				start_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Start date' field ONLY." },
@@ -1322,6 +1444,25 @@ const TOOLS = [
 						"Map of custom field name or numeric id to the value to set, e.g. {\"Requested Due Date\": \"2026-01-15\"}. For a multi-value field, pass an array of values.",
 					additionalProperties: true,
 				},
+			},
+		},
+	},
+	{
+		name: "attach_file",
+		description:
+			"Attach a file to an issue/ticket, optionally with a comment in 'notes'. Pass text as 'content', binary as 'content_base64', or (local server only) a file 'path'. Returns the new attachment's id, size, and url.",
+		inputSchema: {
+			type: "object",
+			required: ["id"],
+			properties: {
+				id: { type: "integer", description: "Issue id" },
+				filename: { type: "string", description: "Name for the attachment, e.g. 'log.txt' (defaults to the file name of 'path')" },
+				content: { type: "string", description: "Text content of the file" },
+				content_base64: { type: "string", description: "Binary content, base64-encoded" },
+				path: { type: "string", description: "Local file path (only when the server runs locally over stdio)" },
+				content_type: { type: "string", description: "MIME type, e.g. 'image/png' (optional)" },
+				description: { type: "string", description: "Attachment description" },
+				notes: { type: "string", description: "Comment to add with the attachment" },
 			},
 		},
 	},
@@ -1520,6 +1661,7 @@ async function handleTool(name, args) {
 				// Enrich with the global definition (required flag, allowed values); the
 				// catalog is admin-only, so non-admin keys just get id + name.
 				const catalog = await customFieldCatalog();
+				const recent = catalog.length ? new Map() : await customFieldValues(project.id);
 				project.issue_custom_fields = project.issue_custom_fields.map((f) => {
 					const def = catalog.find((c) => c.id === f.id);
 					return def
@@ -1531,7 +1673,7 @@ async function handleTool(name, args) {
 								possible_values: def.possible_values?.map((p) => p.value),
 								trackers: def.trackers?.map((t) => t.name),
 						  }
-						: f;
+						: { ...f, ...(recent.get(f.id) ? { recent_values: recent.get(f.id) } : {}) };
 				});
 			}
 			return ok(data);
@@ -1660,13 +1802,35 @@ async function handleTool(name, args) {
 				rest.tag_list = list.length ? list : [""];
 			}
 			if (extra.story_points !== undefined) rest.agile_data_attributes = { story_points: extra.story_points };
+			for (const field of extra.clear || []) applyClear(rest, field, current);
+			const newRelations = (extra.add_relations || []).map((r) => ({
+				issue_to_id: issueNumber(r.issue_id),
+				relation_type: relationType(r.type),
+				...(r.delay !== undefined ? { delay: r.delay } : {}),
+			}));
+			let relationsToRemove = [];
+			if (extra.remove_relations?.length) {
+				const existing = (await redmineRequest(`/issues/${id}/relations.json`))?.relations || [];
+				relationsToRemove = extra.remove_relations.map((ref) => {
+					const n = issueNumber(ref);
+					const rel = existing.find((r) => r.id === n) || existing.find((r) => r.issue_id === n || r.issue_to_id === n);
+					if (!rel) {
+						throw new Error(`No relation '${ref}' on issue ${id}. Relations: ${existing.map((r) => `${r.id} (${r.relation_type} #${r.issue_id === id ? r.issue_to_id : r.issue_id})`).join(", ") || "none"}`);
+					}
+					return rel.id;
+				});
+			}
 			// Redmine's PUT returns 204 No Content, so re-read the issue to confirm
 			// the change actually landed rather than assuming success.
 			if (Object.keys(rest).length) {
-				await redmineRequest(`/issues/${id}.json`, {
-					method: "PUT",
-					body: { issue: rest },
-				});
+				try {
+					await redmineRequest(`/issues/${id}.json`, {
+						method: "PUT",
+						body: { issue: rest },
+					});
+				} catch (e) {
+					throw new Error(await withFieldValuesHint(e?.message || String(e), current?.custom_fields, projectRef));
+				}
 			}
 			for (const who of extra.add_watchers || []) {
 				await redmineRequest(`/issues/${id}/watchers.json`, {
@@ -1677,9 +1841,19 @@ async function handleTool(name, args) {
 			for (const who of extra.remove_watchers || []) {
 				await redmineRequest(`/issues/${id}/watchers/${await resolveUserId(who, projectRef)}.json`, { method: "DELETE" });
 			}
+			for (const relation of newRelations) {
+				await redmineRequest(`/issues/${id}/relations.json`, { method: "POST", body: { relation } });
+			}
+			for (const relId of relationsToRemove) await redmineRequest(`/relations/${relId}.json`, { method: "DELETE" });
+			const relationsChanged = newRelations.length || relationsToRemove.length;
 			const watchersChanged = extra.add_watchers || extra.remove_watchers;
-			const after = (await redmineRequest(`/issues/${id}.json`, { query: watchersChanged ? { include: "watchers" } : {} }))?.issue;
+			const include = [watchersChanged && "watchers", relationsChanged && "relations"].filter(Boolean).join(",");
+			const after = (await redmineRequest(`/issues/${id}.json`, { query: include ? { include } : {} }))?.issue;
 			const notApplied = customFieldsNotApplied(rest.custom_fields, after);
+			if (notApplied.length) {
+				const allowed = await customFieldValues(projectRef);
+				for (const n of notApplied) if (allowed.get(n.id)) n.allowed_values = allowed.get(n.id);
+			}
 			return ok({
 				ok: notApplied.length === 0,
 				id,
@@ -1690,6 +1864,7 @@ async function handleTool(name, args) {
 				tags: tagChange ? await tryOr(() => issueTags(id)) : undefined,
 				story_points: extra.story_points !== undefined ? await tryOr(() => issueStoryPoints(id)) : undefined,
 				watchers: watchersChanged ? (after?.watchers || []).map((w) => w.name) : undefined,
+				relations: relationsChanged ? after?.relations : undefined,
 				updatable_custom_fields: updatableCustomFields(after || current),
 			});
 		}
@@ -1745,12 +1920,16 @@ async function handleTool(name, args) {
 				projectDefs
 			);
 			if (resolved.length) {
-				await redmineRequest(`/issues/${id}.json`, {
-					method: "PUT",
-					body: {
-						issue: { custom_fields: resolved.map((r) => ({ id: r.id, value: r.value })) },
-					},
-				});
+				try {
+					await redmineRequest(`/issues/${id}.json`, {
+						method: "PUT",
+						body: {
+							issue: { custom_fields: resolved.map((r) => ({ id: r.id, value: r.value })) },
+						},
+					});
+				} catch (e) {
+					throw new Error(await withFieldValuesHint(e?.message || String(e), issueDefs, current.project?.id));
+				}
 			}
 			const after = (await redmineRequest(`/issues/${id}.json`))?.issue;
 			const actual = new Map((after?.custom_fields || []).map((f) => [f.id, f]));
@@ -1769,11 +1948,12 @@ async function handleTool(name, args) {
 				}
 			}
 			const tracker = current.tracker?.name ? ` (tracker "${current.tracker.name}")` : "";
+			const allowed = not_applied.length ? await customFieldValues(current.project?.id) : new Map();
 			const problems = [
 				...unknown.map((f) => `unknown custom field "${f}"`),
 				...unavailable.map((u) => `"${u.name}" exists on the project but is not enabled for this issue${tracker}`),
 				...not_applied.map(
-					(n) => `"${n.name}" was rejected by Redmine (requested ${JSON.stringify(n.requested)}, still ${JSON.stringify(n.actual)}) — check the value is one of the field's allowed options`
+					(n) => `"${n.name}" was rejected by Redmine (requested ${JSON.stringify(n.requested)}, still ${JSON.stringify(n.actual)}) — ${allowed.get(n.id) ? `use one of: ${allowed.get(n.id).join(", ")}` : "check the value is one of the field's allowed options"}`
 				),
 			];
 			return ok({
@@ -1790,6 +1970,50 @@ async function handleTool(name, args) {
 					value: d.value ?? "",
 					...(d.multiple ? { multiple: true } : {}),
 				})),
+				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
+			});
+		}
+
+		case "attach_file": {
+			const { id } = args;
+			let filename = args.filename;
+			let buffer;
+			if (args.path) {
+				// Reading server-side files is only safe when the server is the user's own local process.
+				if (HTTP_MODE) return err("'path' is only allowed when the server runs locally (stdio). Send the file as content or content_base64.");
+				const fs = await import("node:fs/promises");
+				const path = await import("node:path");
+				const full = path.resolve(String(args.path));
+				buffer = await fs.readFile(full);
+				filename ||= path.basename(full);
+			} else if (args.content_base64) {
+				buffer = Buffer.from(args.content_base64, "base64");
+			} else if (args.content !== undefined) {
+				buffer = Buffer.from(String(args.content), "utf8");
+			} else {
+				return err("Provide the file as content (text), content_base64, or path.");
+			}
+			if (!filename) return err("Provide a filename, e.g. 'notes.txt'.");
+			const upload = await redmineRequest("/uploads.json", { method: "POST", query: { filename }, rawBody: buffer });
+			const token = upload?.upload?.token;
+			if (!token) throw new Error("Redmine did not return an upload token.");
+			await redmineRequest(`/issues/${id}.json`, {
+				method: "PUT",
+				body: {
+					issue: {
+						uploads: [{ token, filename, content_type: args.content_type, description: args.description }],
+						notes: args.notes,
+					},
+				},
+			});
+			const atts = (await redmineRequest(`/issues/${id}.json`, { query: { include: "attachments" } }))?.issue?.attachments || [];
+			const added = atts.filter((a) => a.filename === filename).sort((a, b) => b.id - a.id)[0];
+			return ok({
+				ok: !!added,
+				id,
+				attachment: added
+					? { id: added.id, filename: added.filename, filesize: added.filesize, content_type: added.content_type, content_url: added.content_url }
+					: undefined,
 				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
 			});
 		}
