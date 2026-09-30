@@ -644,7 +644,7 @@ function matchUser(users, value) {
 	return match?.id != null ? String(match.id) : null;
 }
 
-async function resolveUser(value) {
+async function resolveUser(value, projectRef) {
 	const v = String(value ?? "").trim();
 	if (!v || /^\d+$/.test(v) || /^me$/i.test(v)) return v;
 
@@ -658,9 +658,87 @@ async function resolveUser(value) {
 		const tokens = v.split(/\s+/);
 		if (tokens.length > 1) users = await searchUsers(tokens[tokens.length - 1]);
 	}
-	const resolved = matchUser(users, v) || v;
+	const resolved = matchUser(users, v) || (projectRef ? await matchProjectMember(v, projectRef) : null);
+	if (!resolved) {
+		throw new Error(
+			`Could not find user '${v}'. ${projectRef ? "No project member has that name" : "Pass project_id so the name can be matched against project members"}; or use a numeric user id or 'me'.`
+		);
+	}
 	_userResolveCache.set(cacheKey, resolved);
 	return resolved;
+}
+
+// Non-admin keys cannot list users, so project members are the fallback directory.
+async function resolveUserId(value, projectRef) {
+	const uid = await resolveUser(value, projectRef);
+	return /^me$/i.test(uid) ? String((await redmineRequest("/users/current.json"))?.user?.id) : uid;
+}
+
+async function projectMembers(projectRef) {
+	return loadRef(`members:${projectRef}`, async () => {
+		const acc = [];
+		for (let offset = 0; ; offset += PAGE_SIZE) {
+			const data = await redmineRequest(`/projects/${encodeURIComponent(projectRef)}/memberships.json`, {
+				query: { limit: PAGE_SIZE, offset },
+			});
+			const batch = data?.memberships || [];
+			for (const m of batch) if (m.user || m.group) acc.push(m.user || m.group);
+			if (batch.length < PAGE_SIZE) break;
+		}
+		return acc;
+	});
+}
+
+async function matchProjectMember(value, projectRef) {
+	const lower = value.toLowerCase();
+	const members = await projectMembers(projectRef);
+	const exact = members.filter((m) => (m.name || "").trim().toLowerCase() === lower);
+	if (exact.length === 1) return String(exact[0].id);
+	const partial = members.filter((m) => (m.name || "").toLowerCase().includes(lower));
+	if (partial.length === 1) return String(partial[0].id);
+	if (partial.length > 1) {
+		throw new Error(`'${value}' matches several people: ${partial.slice(0, 10).map((m) => m.name).join(", ")}. Use the full name.`);
+	}
+	return null;
+}
+
+async function tryOr(fn) {
+	try {
+		return await fn();
+	} catch {
+		return undefined;
+	}
+}
+
+// The tags plugin accepts tag_list on write but omits tags from issue JSON; the
+// CSV export is the only API-key-readable source.
+async function issueTags(id) {
+	const data = await redmineRequest("/issues.csv?c[]=tags_relations", {
+		query: { issue_id: id, status_id: "*", set_filter: 1 },
+	});
+	const [header, row] = String(data?.raw ?? "").split(/\r?\n/);
+	if (!row || !header.includes(",")) return undefined;
+	const cell = row.slice(row.indexOf(",") + 1).replace(/^"|"$/g, "").replace(/""/g, '"');
+	return cell ? cell.split(/,\s*/) : [];
+}
+
+async function issueChecklist(id) {
+	const data = await redmineRequest(`/issues/${id}/checklists.json`);
+	return (data?.checklists || []).map((c) => ({ id: c.id, subject: c.subject, is_done: c.is_done }));
+}
+
+async function issueStoryPoints(id) {
+	return (await redmineRequest(`/issues/${id}/agile_data.json`))?.agile_data?.story_points ?? null;
+}
+
+async function resolveVersion(value, projectRef) {
+	const v = String(value ?? "").trim();
+	if (!v || /^\d+$/.test(v)) return v;
+	const versions = await loadRef(`versions:${projectRef}`, async () => {
+		const data = await redmineRequest(`/projects/${encodeURIComponent(projectRef)}/versions.json`);
+		return (data?.versions || []).filter((x) => x.status === "open");
+	});
+	return matchByName(versions, v, "target version");
 }
 
 // ---------------------------------------------------------------------------
@@ -675,12 +753,12 @@ const PAGE_SIZE = 100; // Redmine's max page size.
 // Page through /issues.json until every matching issue is collected (or the cap
 // is hit). Returns the authoritative `total_count` from Redmine even when the
 // collected list is capped, so callers can report the true number of matches.
-async function listAllIssues(query) {
+async function listAllIssues(query, path = "/issues.json") {
 	const acc = [];
 	let offset = 0;
 	let total = 0;
 	for (;;) {
-		const data = await redmineRequest("/issues.json", {
+		const data = await redmineRequest(path, {
 			query: { ...query, limit: PAGE_SIZE, offset },
 		});
 		const batch = data?.issues || [];
@@ -692,6 +770,36 @@ async function listAllIssues(query) {
 		}
 	}
 	return { issues: acc.slice(0, FETCH_ALL_CAP), total_count: total };
+}
+
+// The tags filter only works in explicit f[]/op[]/v[] form, and Redmine then
+// ignores short filters like status_id=open — so convert every filter.
+const NON_FILTER_PARAMS = new Set(["project_id", "sort", "limit", "offset", "query_id"]);
+function explicitFilterRequest(query, tags) {
+	const qs = new URLSearchParams({ set_filter: "1" });
+	const add = (field, op, values) => {
+		qs.append("f[]", field);
+		qs.set(`op[${field}]`, op);
+		for (const v of values) qs.append(`v[${field}][]`, v);
+	};
+	const rest = {};
+	for (const [key, raw] of Object.entries(query)) {
+		if (raw === undefined || raw === "") continue;
+		if (NON_FILTER_PARAMS.has(key)) {
+			rest[key] = raw;
+			continue;
+		}
+		const s = String(raw);
+		if (key === "status_id" && /^(open|closed)$/i.test(s)) {
+			add(key, s.toLowerCase() === "open" ? "o" : "c", []);
+			continue;
+		}
+		const m = s.match(/^(><|>=|<=|!\*|\*|!~|~|!)?(.*)$/);
+		add(key, m[1] || "=", m[2] ? m[2].split("|") : []);
+	}
+	if (!("status_id" in query)) add("status_id", "o", []);
+	add("issue_tags", "=", tags);
+	return { path: `/issues.json?${qs}`, query: rest };
 }
 
 // Turn a human-friendly date filter into the operator syntax Redmine expects.
@@ -876,8 +984,11 @@ const BUILTIN_ISSUE_FIELDS = new Set([
 	"status_id", "priority_id", "assigned_to_id", "author_id", "tracker_id",
 	"category_id", "fixed_version_id", "parent_issue_id", "done_ratio",
 	"due_date", "start_date", "estimated_hours", "watcher_user_ids",
-	"custom_fields",
+	"custom_fields", "is_private", "tag_list", "agile_data_attributes",
 ]);
+
+// update_issue arguments handled by separate API calls, never sent in the PUT body.
+const ISSUE_EXTRA_ARGS = ["tags", "add_tags", "remove_tags", "story_points", "add_watchers", "remove_watchers"];
 
 // Move any top-level key that names a project custom field into custom_fields.
 // A named field wins over a built-in only when it is not itself a built-in key,
@@ -941,6 +1052,67 @@ function resolveCustomFieldsForIssue(input, issueDefs, projectDefs) {
 // When Redmine rejects a create because a project-required custom field is
 // blank, tell the caller exactly which field to pass (and its allowed values
 // when we can see them) so the retry can succeed without guessing.
+// Logging against a ticket uses the ticket's project.
+async function timeEntryProject(args) {
+	if (args.project_id) return resolveProject(args.project_id);
+	const issue = (await redmineRequest(`/issues/${args.issue_id}.json`))?.issue;
+	return issue?.project?.id ? String(issue.project.id) : "";
+}
+
+async function timeEntryActivities(projectRef) {
+	return loadRef(`tea:${projectRef}`, async () => {
+		const data = await redmineRequest(`/projects/${encodeURIComponent(projectRef)}.json`, {
+			query: { include: "time_entry_activities" },
+		});
+		return data?.project?.time_entry_activities || [];
+	});
+}
+
+// Time-entry custom fields with their values. The field catalog is admin-only, so
+// non-admin keys learn fields and values from recent time entries in the project.
+async function timeEntryFieldDefs(projectRef) {
+	return loadRef(`tecf:${projectRef}`, async () => {
+		const catalog = (await customFieldCatalog()).filter((d) => d.customized_type === "time_entry");
+		if (catalog.length) {
+			return catalog.map((d) => ({
+				id: d.id,
+				name: d.name.trim(),
+				required: d.is_required,
+				values: d.possible_values?.map((p) => p.value) || [],
+			}));
+		}
+		const data = await redmineRequest("/time_entries.json", {
+			query: { project_id: projectRef, limit: 100 },
+		});
+		const byId = new Map();
+		for (const te of data?.time_entries || []) {
+			for (const f of te.custom_fields || []) {
+				if (!byId.has(f.id)) byId.set(f.id, { id: f.id, name: f.name.trim(), values: new Set() });
+				for (const v of [].concat(f.value ?? [])) if (v !== "") byId.get(f.id).values.add(v);
+			}
+		}
+		return [...byId.values()].map((d) => ({
+			id: d.id,
+			name: d.name,
+			values: [...d.values].sort(),
+			values_note: "values recently used in this project; others may be allowed",
+		}));
+	});
+}
+
+// Name the field and list its values when Redmine rejects a time entry.
+async function withTimeEntryHint(message, projectRef, defs) {
+	const lower = message.toLowerCase();
+	const hints = defs
+		.filter((d) => lower.includes(`${d.name.toLowerCase()} cannot be blank`) || lower.includes(`${d.name.toLowerCase()} is not included in the list`))
+		.map((d) => `custom_fields {"${d.name}": <value>} with one of: ${d.values.join(", ") || "(unknown)"}`);
+	if (/activity (cannot be blank|is not included in the list)/.test(lower)) {
+		const names = (await timeEntryActivities(projectRef)).map((a) => a.name);
+		hints.push(`activity_id with one of: ${names.join(", ")}`);
+	}
+	return hints.length ? `${message} Retry passing ${hints.join("; and ")}. Ask the user if unsure.` : message;
+}
+
 async function withCustomFieldHint(message, projectRef) {
 	if (!/cannot be blank/i.test(message)) return message;
 	let defs;
@@ -1021,6 +1193,11 @@ const TOOLS = [
 						"Filter by last-updated date (synonyms: updated, modified, changed, edited, touched). Same formats as created_on: a plain date, a 'from|to' range, or an operator like '>=2026-08-01'.",
 				},
 				query_id: { type: "integer", description: "Saved query id" },
+				tags: {
+					type: "array",
+					items: { type: "string" },
+					description: "Only issues tagged with any of these tags, e.g. ['mcp-test']",
+				},
 				sort: { type: "string", description: "Sort field, e.g. 'updated_on:desc'" },
 				fetch_all: {
 					type: "boolean",
@@ -1043,7 +1220,7 @@ const TOOLS = [
 	{
 		name: "get_issue",
 		description:
-			`Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, relations, and 'updatable_custom_fields' (every custom field on the issue with id, name, and current value — empty ones included). Call this before update_issue to see which custom fields exist and what they're called. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'. When referring the user to a ticket, link it as ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
+			`Get one issue/ticket by its id, including its full comment history (journals), attachments, child issues, relations, watchers, tags, checklist, story_points, 'allowed_statuses' (the statuses this ticket may move to), and 'updatable_custom_fields' (every custom field on the issue with id, name, and current value — empty ones included). Call this before update_issue to see which custom fields exist and what they're called. Use this to read the details or discussion of a specific ticket, e.g. 'what's the status of ticket #1234'. When referring the user to a ticket, link it as ${REDMINE_URL || "<redmine-url>"}/issues/<id>.`,
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -1051,7 +1228,7 @@ const TOOLS = [
 				id: { type: "integer", description: "Issue id" },
 				include: {
 					type: "string",
-					description: "Comma-separated include list (default: journals,attachments,children,relations,watchers)",
+					description: "Comma-separated include list (default: journals,attachments,children,relations,watchers,allowed_statuses)",
 				},
 			},
 		},
@@ -1072,8 +1249,10 @@ const TOOLS = [
 				priority_id: { type: "string", description: "Priority id or name" },
 				assigned_to_id: { type: "string", description: "User id, login, email, or full name" },
 				category_id: { type: "integer" },
-				fixed_version_id: { type: "integer" },
+				fixed_version_id: { type: "string", description: "Target version name or id" },
 				parent_issue_id: { type: "integer" },
+				is_private: { type: "boolean" },
+				tags: { type: "array", items: { type: "string" }, description: "Tags to set on the new ticket" },
 				start_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Start date' field ONLY." },
 				due_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Due date' field ONLY — do not use this for similarly named custom fields like 'Requested Due Date'; put those in custom_fields." },
 				estimated_hours: { type: "number" },
@@ -1091,7 +1270,7 @@ const TOOLS = [
 	{
 		name: "update_issue",
 		description:
-			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, edit the subject/description, set % done, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, and tracker. Set custom fields (e.g. 'Requested Due Date') via 'custom_fields' — call get_issue first to see `updatable_custom_fields`. Any custom field Redmine silently refused is listed in `not_applied`. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
+			"Update an existing issue/ticket: change status (e.g. close or reopen), reassign, set priority, target version, parent, private flag, edit the subject/description, set % done or story points, change tags, add/remove watchers, or add a comment via 'notes'. Only the fields you provide are changed. Names work as well as ids for status, priority, assignee, tracker, target version and watchers. Use add_tags/remove_tags to change tags without touching the others. Set custom fields (e.g. 'Requested Due Date') via 'custom_fields' — call get_issue first to see `updatable_custom_fields` and `allowed_statuses`. Any custom field Redmine silently refused is listed in `not_applied`. After writing it re-reads the issue and returns the resulting state (with the fields you changed) so the update is verified, not assumed; a validation problem is reported with Redmine's exact reason.",
 		inputSchema: {
 			type: "object",
 			required: ["id"],
@@ -1106,7 +1285,15 @@ const TOOLS = [
 				assigned_to_id: { type: "string", description: "User id, login, email, or full name" },
 				tracker_id: { type: "string", description: "Tracker id or name" },
 				category_id: { type: "integer" },
-				fixed_version_id: { type: "integer" },
+				fixed_version_id: { type: "string", description: "Target version name or id" },
+				parent_issue_id: { type: "integer", description: "Parent ticket id" },
+				is_private: { type: "boolean" },
+				tags: { type: "array", items: { type: "string" }, description: "Replace ALL tags with this list ([] removes every tag)" },
+				add_tags: { type: "array", items: { type: "string" }, description: "Tags to add, keeping existing ones" },
+				remove_tags: { type: "array", items: { type: "string" }, description: "Tags to remove, keeping the rest" },
+				story_points: { type: "number", description: "Agile story points" },
+				add_watchers: { type: "array", items: { type: "string" }, description: "People to add as watchers (name, login, id, or 'me')" },
+				remove_watchers: { type: "array", items: { type: "string" }, description: "Watchers to remove (name, login, id, or 'me')" },
 				done_ratio: { type: "integer", minimum: 0, maximum: 100 },
 				due_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Due date' field ONLY — do not use this for similarly named custom fields like 'Requested Due Date'; put those in custom_fields." },
 				start_date: { type: "string", description: "YYYY-MM-DD. The built-in 'Start date' field ONLY." },
@@ -1135,6 +1322,22 @@ const TOOLS = [
 						"Map of custom field name or numeric id to the value to set, e.g. {\"Requested Due Date\": \"2026-01-15\"}. For a multi-value field, pass an array of values.",
 					additionalProperties: true,
 				},
+			},
+		},
+	},
+	{
+		name: "update_checklist",
+		description:
+			"Add, check off, uncheck, or remove checklist items on an issue/ticket. Refer to existing items by id or exact text (get_issue shows the checklist). Returns the resulting checklist.",
+		inputSchema: {
+			type: "object",
+			required: ["id"],
+			properties: {
+				id: { type: "integer", description: "Issue id" },
+				add: { type: "array", items: { type: "string" }, description: "Text of new items to add" },
+				check: { type: "array", items: { type: "string" }, description: "Items to mark done (id or text)" },
+				uncheck: { type: "array", items: { type: "string" }, description: "Items to mark not done (id or text)" },
+				remove: { type: "array", items: { type: "string" }, description: "Items to delete (id or text)" },
 			},
 		},
 	},
@@ -1209,28 +1412,36 @@ const TOOLS = [
 		},
 	},
 	{
+		name: "get_time_entry_options",
+		description:
+			"Get the valid choices for logging time on a ticket or project: the activities (e.g. 'Development', 'Meeting') and the time-entry custom fields such as 'Billable Status' with their values. Call this before create_time_entry when the user did not say which activity or billable status to use, then ask the user to pick — do not guess billing.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				issue_id: { type: "integer", description: "Ticket id (its project is used)" },
+				project_id: { type: "string", description: "Project id, identifier, or name (when not logging against a ticket)" },
+			},
+		},
+	},
+	{
 		name: "create_time_entry",
 		description:
-			"Log time (hours worked) against an issue/ticket or a project. Use when the user says things like 'log 2 hours on ticket #123'. Provide either issue_id or project_id along with hours. Some instances require a time-entry custom field such as a billable status; pass it via 'custom_fields'. Omit activity_id unless you have a real activity id (do not send 0).",
+			"Log time (hours worked) on an issue/ticket or a project, e.g. 'log 2 hours on ticket #123 for development, non-billable bug fix'. Provide issue_id (or project_id), hours, spent_on, comments, activity_id (a name like 'Development' works), and any required time-entry custom fields such as 'Billable Status' in custom_fields. If the activity or billable status is not known, call get_time_entry_options and ask the user. Returns the created entry so you can confirm it was logged.",
 		inputSchema: {
 			type: "object",
 			required: ["hours"],
 			properties: {
-				issue_id: { type: "integer" },
-				project_id: { type: "string" },
-				hours: { type: "number" },
+				issue_id: { type: "integer", description: "Ticket id" },
+				project_id: { type: "string", description: "Project id, identifier, or name (only when not logging against a ticket)" },
+				hours: { type: "number", description: "Hours spent, e.g. 0.25 or 1.5" },
 				spent_on: { type: "string", description: "YYYY-MM-DD (default: today)" },
-				activity_id: {
-					type: "integer",
-					description:
-						"Optional activity id. Only send a real, positive id; omit it (do not pass 0) to use the project's default activity.",
-				},
-				comments: { type: "string" },
+				activity_id: { type: "string", description: "Activity name (e.g. 'Development', 'Meeting') or id" },
+				comments: { type: "string", description: "What the time was spent on" },
 				custom_fields: {
 					type: "object",
 					additionalProperties: true,
 					description:
-						"Time-entry custom field values keyed by field name or numeric id, e.g. {\"Billable status\": \"Billable\"}. Required by some instances that make a billable status mandatory.",
+						"Time-entry custom field values keyed by field name or id, e.g. {\"Billable Status\": \"Non-Billable-Bug/Defect\"}. Valid names and values come from get_time_entry_options.",
 				},
 			},
 		},
@@ -1327,22 +1538,26 @@ async function handleTool(name, args) {
 		}
 
 		case "list_issues": {
-			const { fetch_all, detail, ...filters } = args;
+			const { fetch_all, detail, tags, ...filters } = args;
 			const query = { ...filters };
 			if (query.project_id) query.project_id = await resolveProject(query.project_id);
 			if (query.tracker_id) query.tracker_id = await resolveTracker(query.tracker_id);
 			if (query.priority_id) query.priority_id = await resolvePriority(query.priority_id);
 			if (query.status_id) query.status_id = await resolveStatus(query.status_id);
-			if (query.assigned_to_id) query.assigned_to_id = await resolveUser(query.assigned_to_id);
-			if (query.author_id) query.author_id = await resolveUser(query.author_id);
+			if (query.assigned_to_id) query.assigned_to_id = await resolveUser(query.assigned_to_id, query.project_id);
+			if (query.author_id) query.author_id = await resolveUser(query.author_id, query.project_id);
 			if (query.created_on) query.created_on = normalizeDateFilter(query.created_on);
 			if (query.updated_on) query.updated_on = normalizeDateFilter(query.updated_on);
 
+			const tagList = [].concat(tags ?? []).filter(Boolean);
+			const request = tagList.length
+				? explicitFilterRequest(query, tagList)
+				: { path: "/issues.json", query };
 			if (fetch_all) {
-				const { issues, total_count } = await listAllIssues(query);
+				const { issues, total_count } = await listAllIssues(request.query, request.path);
 				return ok(issueListResult({ issues, total_count, offset: 0, detail }));
 			}
-			const data = await redmineRequest("/issues.json", { query });
+			const data = await redmineRequest(request.path, { query: request.query });
 			return ok(
 				issueListResult({
 					issues: data?.issues || [],
@@ -1355,18 +1570,29 @@ async function handleTool(name, args) {
 		}
 
 		case "get_issue": {
-			const include = args.include || "journals,attachments,children,relations,watchers";
+			const include = args.include || "journals,attachments,children,relations,watchers,allowed_statuses";
 			const data = await redmineRequest(`/issues/${args.id}.json`, { query: { include } });
-			return ok({ ...data, updatable_custom_fields: updatableCustomFields(data?.issue) });
+			const [tags, checklist, story_points] = await Promise.all([
+				tryOr(() => issueTags(args.id)),
+				tryOr(() => issueChecklist(args.id)),
+				tryOr(() => issueStoryPoints(args.id)),
+			]);
+			return ok({
+				issue: { ...data?.issue, tags, checklist, story_points },
+				updatable_custom_fields: updatableCustomFields(data?.issue),
+			});
 		}
 
 		case "create_issue": {
-			const issue = compactIssueFields(args);
+			const { tags, ...fields } = args;
+			const issue = compactIssueFields(fields);
 			if (issue.project_id) issue.project_id = await resolveProject(issue.project_id);
 			if (issue.tracker_id) issue.tracker_id = await resolveTracker(issue.tracker_id);
 			if (issue.status_id) issue.status_id = await resolveStatus(issue.status_id);
 			if (issue.priority_id) issue.priority_id = await resolvePriority(issue.priority_id);
-			if (issue.assigned_to_id) issue.assigned_to_id = await resolveUser(issue.assigned_to_id);
+			if (issue.assigned_to_id) issue.assigned_to_id = await resolveUser(issue.assigned_to_id, issue.project_id);
+			if (issue.fixed_version_id) issue.fixed_version_id = await resolveVersion(issue.fixed_version_id, issue.project_id);
+			if (tags?.length) issue.tag_list = tags;
 			const hasNamedFields =
 				issue.custom_fields || Object.keys(issue).some((k) => !BUILTIN_ISSUE_FIELDS.has(k));
 			if (hasNamedFields) {
@@ -1396,7 +1622,13 @@ async function handleTool(name, args) {
 
 		case "update_issue": {
 			const { id, ...rest } = compactIssueFields(args);
+			const extra = {};
+			for (const k of ISSUE_EXTRA_ARGS) {
+				if (args[k] !== undefined) extra[k] = args[k];
+				delete rest[k];
+			}
 			const current = (await redmineRequest(`/issues/${id}.json`))?.issue;
+			const projectRef = current?.project?.id ? String(current.project.id) : undefined;
 			// If the caller passed custom_fields or any key we don't recognize as a
 			// built-in issue field (e.g. "Requested Due Date"), resolve them against
 			// this issue's project so named fields land in custom_fields, never on a
@@ -1416,24 +1648,79 @@ async function handleTool(name, args) {
 			if (rest.tracker_id) rest.tracker_id = await resolveTracker(rest.tracker_id);
 			if (rest.status_id) rest.status_id = await resolveStatus(rest.status_id);
 			if (rest.priority_id) rest.priority_id = await resolvePriority(rest.priority_id);
-			if (rest.assigned_to_id) rest.assigned_to_id = await resolveUser(rest.assigned_to_id);
+			if (rest.assigned_to_id) rest.assigned_to_id = await resolveUser(rest.assigned_to_id, projectRef);
+			if (rest.fixed_version_id) rest.fixed_version_id = await resolveVersion(rest.fixed_version_id, projectRef);
+			const tagChange = extra.tags ?? extra.add_tags ?? extra.remove_tags;
+			if (tagChange) {
+				const base = extra.tags ?? (await tryOr(() => issueTags(id)));
+				if (!base) throw new Error("Could not read the current tags; pass the complete list in 'tags' instead.");
+				const drop = new Set((extra.remove_tags || []).map((t) => t.toLowerCase()));
+				const list = [...new Set([...base, ...(extra.add_tags || [])])].filter((t) => !drop.has(t.toLowerCase()));
+				// An empty array is dropped by Rails; [""] clears all tags.
+				rest.tag_list = list.length ? list : [""];
+			}
+			if (extra.story_points !== undefined) rest.agile_data_attributes = { story_points: extra.story_points };
 			// Redmine's PUT returns 204 No Content, so re-read the issue to confirm
 			// the change actually landed rather than assuming success.
-			await redmineRequest(`/issues/${id}.json`, {
-				method: "PUT",
-				body: { issue: rest },
-			});
-			const after = (await redmineRequest(`/issues/${id}.json`))?.issue;
+			if (Object.keys(rest).length) {
+				await redmineRequest(`/issues/${id}.json`, {
+					method: "PUT",
+					body: { issue: rest },
+				});
+			}
+			for (const who of extra.add_watchers || []) {
+				await redmineRequest(`/issues/${id}/watchers.json`, {
+					method: "POST",
+					body: { user_id: Number(await resolveUserId(who, projectRef)) },
+				});
+			}
+			for (const who of extra.remove_watchers || []) {
+				await redmineRequest(`/issues/${id}/watchers/${await resolveUserId(who, projectRef)}.json`, { method: "DELETE" });
+			}
+			const watchersChanged = extra.add_watchers || extra.remove_watchers;
+			const after = (await redmineRequest(`/issues/${id}.json`, { query: watchersChanged ? { include: "watchers" } : {} }))?.issue;
 			const notApplied = customFieldsNotApplied(rest.custom_fields, after);
 			return ok({
 				ok: notApplied.length === 0,
 				id,
-				updated_fields: Object.keys(rest),
+				updated_fields: [...Object.keys(rest), ...Object.keys(extra)],
 				not_applied: notApplied.length ? notApplied : undefined,
 				url: REDMINE_URL ? `${REDMINE_URL}/issues/${id}` : undefined,
 				issue: after ? summarizeIssue(after) : null,
+				tags: tagChange ? await tryOr(() => issueTags(id)) : undefined,
+				story_points: extra.story_points !== undefined ? await tryOr(() => issueStoryPoints(id)) : undefined,
+				watchers: watchersChanged ? (after?.watchers || []).map((w) => w.name) : undefined,
 				updatable_custom_fields: updatableCustomFields(after || current),
 			});
+		}
+
+		case "update_checklist": {
+			const { id } = args;
+			const items = await issueChecklist(id);
+			const find = (ref) => {
+				const s = String(ref).trim().toLowerCase();
+				const item = items.find((i) => String(i.id) === s || i.subject.trim().toLowerCase() === s);
+				if (!item) {
+					throw new Error(`No checklist item '${ref}' on issue ${id}. Items: ${items.map((i) => `${i.id} "${i.subject}"`).join(", ") || "none"}`);
+				}
+				return item.id;
+			};
+			const check = (args.check || []).map(find);
+			const uncheck = (args.uncheck || []).map(find);
+			const remove = (args.remove || []).map(find);
+			for (const subject of args.add || []) {
+				await redmineRequest(`/issues/${id}/checklists.json`, {
+					method: "POST",
+					body: { checklist: { subject, is_done: false } },
+				});
+			}
+			for (const [ids, is_done] of [[check, true], [uncheck, false]]) {
+				for (const itemId of ids) {
+					await redmineRequest(`/checklists/${itemId}.json`, { method: "PUT", body: { checklist: { is_done } } });
+				}
+			}
+			for (const itemId of remove) await redmineRequest(`/checklists/${itemId}.json`, { method: "DELETE" });
+			return ok({ ok: true, id, checklist: await issueChecklist(id) });
 		}
 
 		case "set_custom_fields": {
@@ -1545,29 +1832,58 @@ async function handleTool(name, args) {
 			return ok(await redmineRequest("/time_entries.json", { query }));
 		}
 
+		case "get_time_entry_options": {
+			if (!args.issue_id && !args.project_id) return err("Provide issue_id or project_id.");
+			const projectRef = await timeEntryProject(args);
+			return ok({
+				project_id: projectRef,
+				activities: (await timeEntryActivities(projectRef)).map((a) => a.name),
+				custom_fields: await timeEntryFieldDefs(projectRef),
+			});
+		}
+
 		case "create_time_entry": {
 			const entry = { ...args };
-			if (entry.project_id) entry.project_id = await resolveProject(entry.project_id);
-			// activity_id 0 (or any non-positive value) is not a real activity and
-			// Redmine rejects it with "Activity is not included in the list"; drop it
-			// so the project's default activity is used.
-			if (!(Number.isInteger(entry.activity_id) && entry.activity_id > 0))
-				delete entry.activity_id;
-			// Some instances require a custom field on time entries (e.g. a
-			// "Billable status"); map any provided names/ids to the API shape.
-			if (entry.custom_fields) {
-				const defs = (await customFieldCatalog()).filter(
-					(d) => d.customized_type === "time_entry"
+			if (!entry.issue_id && !entry.project_id) return err("Provide issue_id (the ticket) or project_id.");
+			const projectRef = await timeEntryProject(entry);
+			if (entry.project_id) entry.project_id = projectRef;
+			const activity = String(entry.activity_id ?? "").trim();
+			delete entry.activity_id;
+			// 0 is not a real activity; leaving it out uses the project default.
+			if (activity && !/^0+$/.test(activity)) {
+				entry.activity_id = Number(
+					/^\d+$/.test(activity)
+						? activity
+						: matchByName(await timeEntryActivities(projectRef), activity, "activity")
 				);
+			}
+			const defs = await timeEntryFieldDefs(projectRef);
+			if (entry.custom_fields) {
 				entry.custom_fields = toCustomFieldList(entry.custom_fields, defs);
 				if (!entry.custom_fields) delete entry.custom_fields;
 			}
-			return ok(
-				await redmineRequest("/time_entries.json", {
+			let created;
+			try {
+				created = await redmineRequest("/time_entries.json", {
 					method: "POST",
 					body: { time_entry: entry },
-				})
-			);
+				});
+			} catch (e) {
+				throw new Error(await withTimeEntryHint(e?.message || String(e), projectRef, defs));
+			}
+			const te = created?.time_entry;
+			return ok({
+				ok: true,
+				id: te?.id,
+				issue_id: te?.issue?.id,
+				project: te?.project?.name,
+				spent_on: te?.spent_on,
+				hours: te?.hours,
+				activity: te?.activity?.name,
+				comments: te?.comments,
+				custom_fields: Object.fromEntries((te?.custom_fields || []).map((f) => [f.name.trim(), f.value])),
+				url: REDMINE_URL && te?.issue?.id ? `${REDMINE_URL}/issues/${te.issue.id}/time_entries` : undefined,
+			});
 		}
 
 		case "list_issue_attachments": {
@@ -1679,6 +1995,8 @@ function normalizeArgs(name, args) {
 			args[key] = Number(raw);
 		} else if (type === "boolean" && /^(true|false)$/i.test(raw)) {
 			args[key] = raw.toLowerCase() === "true";
+		} else if (type === "array") {
+			args[key] = raw.split(",").map((s) => s.trim()).filter(Boolean);
 		}
 	}
 	const missing = (schema.required || []).filter((k) => args[k] === undefined);
@@ -1701,7 +2019,7 @@ function createMcpServer() {
 				"For counts ('how many ...') read total_count from the result, never the length of the issues array; for a complete list across pages pass fetch_all: true.",
 				"To comment on a ticket: use add_issue_note. To change status, assignee, priority, or other fields: use update_issue.",
 				"Most filter fields accept human-friendly values: names, logins, emails, or 'me' — you do not need numeric ids.",
-				"To log hours worked: use create_time_entry. To see who the current user is: current_user.",
+				"To log hours worked: use create_time_entry; if the activity or billable status is unknown, call get_time_entry_options and ask the user. To see who the current user is: current_user.",
 				`Deep links: whenever you mention an issue/ticket to the user, include a clickable link of the form ${REDMINE_URL || "<redmine-url>"}/issues/<id> (e.g. after creating or finding a ticket). Link a project as ${REDMINE_URL || "<redmine-url>"}/projects/<identifier>, and a specific comment as ${REDMINE_URL || "<redmine-url>"}/issues/<id>#note-<n>.`,
 			].join("\n"),
 		}

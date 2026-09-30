@@ -30,15 +30,17 @@ Ask your editor's AI to *"summarize Redmine #12345"*, *"list my open tickets"*, 
 | `current_user` | Return the user that owns the API key (useful for sanity checks) |
 | `list_projects` | List visible projects |
 | `get_project` | Get one project by id or identifier |
-| `list_issues` | Search/filter issues (project, assignee, status, sort, …) |
-| `get_issue` | Fetch one issue with journals, attachments, children, relations |
+| `list_issues` | Search/filter issues (project, assignee, status, tags, sort, …) |
+| `get_issue` | Fetch one issue with journals, attachments, children, relations, watchers, tags, checklist, story points, and allowed next statuses |
 | `create_issue` | Create a new issue |
-| `update_issue` | Update any field on an existing issue |
+| `update_issue` | Update any field on an existing issue, including tags, story points, watchers, target version, parent, and private flag |
+| `update_checklist` | Add, check, uncheck, or remove checklist items |
 | `add_issue_note` | Add a comment (journal note), optionally private |
 | `list_users` | List users (admin) or filter by name/status |
 | `search` | Full-text search across issues, wiki, news, documents |
 | `list_time_entries` | List time entries with filters |
-| `create_time_entry` | Log time against an issue or project |
+| `get_time_entry_options` | Valid activities and time-entry custom field values (e.g. Billable Status) for a ticket or project |
+| `create_time_entry` | Log time against an issue or project (activity and custom fields by name) |
 | `list_issue_attachments` | List attachments on an issue (id, filename, content-type, size) |
 | `get_attachment` | Download an attachment by id — **images are returned inline as MCP image content** so the model can view them; other files are returned as base64 and optionally written to disk via `save_to` |
 

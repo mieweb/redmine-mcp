@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which pins each connection's era from its opening message. Requires **Node.js 20+**.
 
 ### Added
+- Parity with the issue edit form: tags (read, filter, set/add/remove), Agile story
+  points, watchers (add/remove by name), target version by name, parent task,
+  private flag, and `allowed_statuses` in `get_issue`. New `update_checklist` tool
+  for the Checklists plugin.
 - Verifiable writes. `redmine_update_issue`, `redmine_create_issue`, and
   `redmine_add_issue_note` now re-read from Redmine after writing and return the
   resulting issue (or the recorded note), instead of assuming success — a PUT
@@ -24,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it worked. `create` also returns the new id and a direct url. (#158273)
 
 ### Fixed
+- User names resolve for non-admin API keys. `/users.json` is admin-only, so a
+  filter like "assigned to Aaron Capriglione" silently returned 0 issues; names are
+  now matched against project members, and an unresolvable name is an error.
+- Logging time works for non-admin API keys. `create_time_entry` previously failed
+  with "Unknown custom field 'Billable Status'" because the custom field catalog is
+  admin-only; time-entry fields and their values are now learned from recent entries
+  in the project. `activity_id` accepts a name (e.g. "Development"), rejected entries
+  name the missing field with its values, and the result is a compact confirmation.
+  New `get_time_entry_options` returns the valid activities and Billable Status
+  values for a ticket so the model can ask the user instead of guessing.
 - More reliable tool calls from LLM clients. Arguments are coerced to their schema
   type (`"#1234"` → `1234`, `"1.5"` → `1.5`, `"true"` → `true`), empty values are
   dropped, and missing/invalid arguments fail early with a clear message. 404/403/422
