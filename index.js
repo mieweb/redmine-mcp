@@ -967,7 +967,19 @@ async function customFieldValues(projectRef) {
 			catalog.filter((c) => c.possible_values?.length).map((c) => [c.id, c.possible_values.map((p) => p.value)])
 		);
 	}
-	return loadRef(`cfvals:${projectRef}`, async () => {
+	const sample = await recentIssueFieldSample(projectRef);
+	return new Map(
+		[...sample]
+			.filter(([, s]) => s.size && s.size <= 40)
+			// Dates and user ids are not choices worth suggesting.
+			.filter(([, s]) => ![...s].every((v) => /^\d+$|^\d{4}-\d{2}-\d{2}$/.test(v)))
+			.map(([id, s]) => [id, [...s].sort()])
+	);
+}
+
+// Custom field id -> values seen on the project's recently updated issues.
+async function recentIssueFieldSample(projectRef) {
+	return loadRef(`cfsample:${projectRef}`, async () => {
 		const data = await tryOr(() =>
 			redmineRequest("/issues.json", {
 				query: { project_id: projectRef, status_id: "*", sort: "updated_on:desc", limit: PAGE_SIZE },
@@ -980,14 +992,35 @@ async function customFieldValues(projectRef) {
 				for (const v of [].concat(f.value ?? [])) if (v !== "") byId.get(f.id).add(String(v));
 			}
 		}
-		return new Map(
-			[...byId]
-				.filter(([, s]) => s.size && s.size <= 40)
-				// Dates and user ids are not choices worth suggesting.
-				.filter(([, s]) => ![...s].every((v) => /^\d+$|^\d{4}-\d{2}-\d{2}$/.test(v)))
-				.map(([id, s]) => [id, [...s].sort()])
-		);
+		return byId;
 	});
+}
+
+// Ids of user-type custom fields, whose values are user ids (e.g. "Requested Resource").
+async function userCustomFieldIds(projectRef) {
+	const catalog = await customFieldCatalog();
+	if (catalog.length) return new Set(catalog.filter((c) => c.field_format === "user").map((c) => c.id));
+	const [sample, members] = await Promise.all([recentIssueFieldSample(projectRef), tryOr(() => projectMembers(projectRef))]);
+	const memberIds = new Set((members || []).map((m) => String(m.id)));
+	return new Set(
+		[...sample]
+			.filter(([, s]) => s.size && [...s].every((v) => /^\d+$/.test(v)) && [...s].some((v) => memberIds.has(v)))
+			.map(([id]) => id)
+	);
+}
+
+// Let callers name a person for a user-type custom field instead of a user id.
+async function resolveUserFieldValues(list, projectRef) {
+	if (!list?.length || !projectRef) return list;
+	const userIds = await userCustomFieldIds(projectRef);
+	const toId = (v) => (v === "" || /^\d+$/.test(String(v)) ? v : resolveUserId(v, projectRef));
+	return Promise.all(
+		list.map(async (f) =>
+			userIds.has(f.id)
+				? { ...f, value: Array.isArray(f.value) ? await Promise.all(f.value.map(toId)) : await toId(f.value) }
+				: f
+		)
+	);
 }
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1574,7 +1607,7 @@ const TOOLS = [
 			properties: {
 				issue_id: { type: "integer", description: "Ticket id" },
 				project_id: { type: "string", description: "Project id, identifier, or name (only when not logging against a ticket)" },
-				hours: { type: "number", description: "Hours spent, e.g. 0.25 or 1.5" },
+				hours: { type: "number", description: "Hours spent in 0.25 increments, e.g. 0.25, 0.5, 1.75 (h:mm like 1:15 also works)" },
 				spent_on: { type: "string", description: "YYYY-MM-DD (default: today)" },
 				activity_id: { type: "string", description: "Activity name (e.g. 'Development', 'Meeting') or id" },
 				comments: { type: "string", description: "What the time was spent on" },
@@ -1742,7 +1775,7 @@ async function handleTool(name, args) {
 				const routed = routeNamedCustomFields(issue, defs);
 				for (const k of Object.keys(issue)) delete issue[k];
 				Object.assign(issue, routed);
-				if (issue.custom_fields) issue.custom_fields = toCustomFieldList(issue.custom_fields, defs);
+				if (issue.custom_fields) issue.custom_fields = await resolveUserFieldValues(toCustomFieldList(issue.custom_fields, defs), issue.project_id);
 			}
 			let created;
 			try {
@@ -1785,7 +1818,7 @@ async function handleTool(name, args) {
 				const routed = routeNamedCustomFields(rest, defs);
 				for (const k of Object.keys(rest)) delete rest[k];
 				Object.assign(rest, routed);
-				if (rest.custom_fields) rest.custom_fields = toCustomFieldList(rest.custom_fields, defs);
+				if (rest.custom_fields) rest.custom_fields = await resolveUserFieldValues(toCustomFieldList(rest.custom_fields, defs), projectRef);
 			}
 			if (rest.tracker_id) rest.tracker_id = await resolveTracker(rest.tracker_id);
 			if (rest.status_id) rest.status_id = await resolveStatus(rest.status_id);
@@ -1914,11 +1947,12 @@ async function handleTool(name, args) {
 			const projectDefs = current.project?.id
 				? await projectCustomFields(current.project.id)
 				: [];
-			const { resolved, unavailable, unknown } = resolveCustomFieldsForIssue(
+			const { resolved: named, unavailable, unknown } = resolveCustomFieldsForIssue(
 				fields,
 				issueDefs,
 				projectDefs
 			);
+			const resolved = await resolveUserFieldValues(named, current.project?.id ? String(current.project.id) : undefined);
 			if (resolved.length) {
 				try {
 					await redmineRequest(`/issues/${id}.json`, {
@@ -2068,6 +2102,11 @@ async function handleTool(name, args) {
 
 		case "create_time_entry": {
 			const entry = { ...args };
+			// Company policy: time is logged in quarter hours.
+			if (!(entry.hours > 0) || !Number.isInteger(entry.hours * 4)) {
+				const nearest = Math.max(0.25, Math.round((entry.hours || 0) * 4) / 4);
+				return err(`Hours must be a positive multiple of 0.25 (e.g. 0.25, 0.5, 0.75, 2.25); got ${Math.round((entry.hours || 0) * 100) / 100}. Did you mean ${nearest}? Confirm with the user.`);
+			}
 			if (!entry.issue_id && !entry.project_id) return err("Provide issue_id (the ticket) or project_id.");
 			const projectRef = await timeEntryProject(entry);
 			if (entry.project_id) entry.project_id = projectRef;
@@ -2213,8 +2252,13 @@ function normalizeArgs(name, args) {
 			}
 			args[key] = Number(digits);
 		} else if (type === "number") {
+			const hm = raw.match(/^(\d+):([0-5]\d)$/);
+			if (hm) {
+				args[key] = Number(hm[1]) + Number(hm[2]) / 60;
+				continue;
+			}
 			if (!/^-?(\d+\.?\d*|\.\d+)$/.test(raw)) {
-				throw new Error(`Argument '${key}' must be a number like 1.5 (got ${JSON.stringify(value)}).`);
+				throw new Error(`Argument '${key}' must be a number like 1.5 or h:mm like 1:30 (got ${JSON.stringify(value)}).`);
 			}
 			args[key] = Number(raw);
 		} else if (type === "boolean" && /^(true|false)$/i.test(raw)) {

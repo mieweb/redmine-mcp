@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it worked. `create` also returns the new id and a direct url. (#158273)
 
 ### Fixed
+- Time entries must be in quarter hours (0.25, 0.5, 0.75, 2.25, ...). Other
+  values are rejected before anything is saved, with the nearest valid amount
+  suggested; `h:mm` input such as `1:15` is accepted.
+- User-type custom fields (e.g. "Requested Resource") accept a person's name, not
+  only a numeric user id.
 - User names resolve for non-admin API keys. `/users.json` is admin-only, so a
   filter like "assigned to Aaron Capriglione" silently returned 0 issues; names are
   now matched against project members, and an unresolvable name is an error.
