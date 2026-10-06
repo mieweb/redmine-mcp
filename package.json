@@ -16,7 +16,12 @@
   ],
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js"
+    "check": "node --check index.js",
+    "eval:tools": "npx -y promptfoo@0.124.0 eval -c evals/tools.yaml --no-cache",
+    "eval:tools:mock": "REDMINE_URL=http://127.0.0.1:8765 REDMINE_API_KEY=mock REDMINE_EVAL_PROJECT=sandbox REDMINE_EVAL_ISSUE=1234 npx -y promptfoo@0.124.0 eval -c evals/tools.yaml --no-cache",
+    "eval:routing": "npx -y promptfoo@0.124.0 eval -c evals/routing.yaml --no-cache",
+    "eval:redteam": "npx -y promptfoo@0.124.0 redteam run -c evals/redteam.config.yaml",
+    "eval:view": "npx -y promptfoo@0.124.0 view"
   },
   "keywords": [
     "mcp",

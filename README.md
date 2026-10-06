@@ -418,6 +418,26 @@ REDMINE_API_KEY=xxxx \
 node index.js
 ```
 
+### Evals ([promptfoo](https://github.com/promptfoo/promptfoo))
+
+The `evals/` folder tests the server with promptfoo. The LLM evals run against
+an in-memory fake Redmine ([evals/mock-redmine.js](evals/mock-redmine.js)), so
+the model's writes never reach a real instance.
+
+- `npm run eval:tools:mock` calls each tool directly (no LLM) against the mock
+  and checks the shape of the result ([evals/tools.yaml](evals/tools.yaml)).
+- `npm run eval:tools` runs the same read-only checks against a real sandbox.
+  Set `REDMINE_URL`, `REDMINE_API_KEY`, `REDMINE_EVAL_PROJECT` and `REDMINE_EVAL_ISSUE`.
+- `npm run eval:routing` lets a model use the tools and checks which tools and
+  arguments it chose, for example `created_on` versus `updated_on`, or a custom
+  field versus the built-in `due_date`. It also checks that instructions planted
+  in a ticket are not followed ([evals/routing.yaml](evals/routing.yaml)).
+  Needs `ANTHROPIC_API_KEY`.
+- `npm run eval:redteam` generates and runs attacks such as excessive agency,
+  hijacking, PII, BOLA/BFLA and prompt injection
+  ([evals/redteam.config.yaml](evals/redteam.config.yaml)). Needs `ANTHROPIC_API_KEY`.
+- `npm run eval:view` opens the results UI.
+
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## 📄 License

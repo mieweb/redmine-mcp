@@ -1,0 +1,112 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+# Contract tests: call redmine-mcp tools directly (no LLM) and check the result shape.
+# Read-only. Uses REDMINE_URL, REDMINE_API_KEY, REDMINE_EVAL_PROJECT, REDMINE_EVAL_ISSUE;
+# `npm run eval:tools:mock` points them at the in-memory mock instead.
+description: redmine-mcp tool contracts
+
+extensions:
+  - file://mock-redmine.js:extensionHook
+
+providers:
+  - id: mcp
+    config:
+      enabled: true
+      server:
+        path: ../index.js
+        name: redmine
+      transformResponse: result.content?.find((c) => c.type === 'text')?.text ?? content
+
+prompts:
+  - '{"tool": "{{ tool }}", "args": {{ args | dump | safe }}}'
+
+tests:
+  - description: current_user returns the API key's user
+    vars:
+      tool: current_user
+      args: {}
+    assert:
+      - type: is-json
+      - type: javascript
+        value: JSON.parse(output).user?.id > 0
+
+  - description: list_projects returns a project list
+    vars:
+      tool: list_projects
+      args: { limit: 5 }
+    assert:
+      - type: javascript
+        value: Array.isArray(JSON.parse(output).projects)
+
+  - description: list_issues reports an authoritative total_count and a compact page
+    vars:
+      tool: list_issues
+      args: { project_id: '{{ env.REDMINE_EVAL_PROJECT }}', status_id: '*', limit: 2 }
+    assert:
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          return typeof r.total_count === 'number'
+            && r.count === r.issues.length
+            && r.count <= 2
+            && r.has_more === r.total_count > r.count
+            && r.issues.every((i) => typeof i.project === 'string' || i.project === null);
+
+  - description: list_issues summary flattens custom fields to name -> value
+    vars:
+      tool: list_issues
+      args: { project_id: '{{ env.REDMINE_EVAL_PROJECT }}', status_id: '*', limit: 25 }
+    assert:
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          return r.issues.every((i) => i.custom_fields === undefined
+            || (!Array.isArray(i.custom_fields) && typeof i.custom_fields === 'object'));
+
+  - description: list_issues accepts a created_on operator filter
+    vars:
+      tool: list_issues
+      args: { project_id: '{{ env.REDMINE_EVAL_PROJECT }}', status_id: '*', created_on: '>=2000-01-01', limit: 1 }
+    assert:
+      - type: javascript
+        value: typeof JSON.parse(output).total_count === 'number'
+
+  - description: get_issue exposes updatable_custom_fields
+    vars:
+      tool: get_issue
+      args: { id: '{{ env.REDMINE_EVAL_ISSUE }}' }
+    assert:
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          return r.issue?.id === Number(process.env.REDMINE_EVAL_ISSUE)
+            && Array.isArray(r.updatable_custom_fields)
+            && r.updatable_custom_fields.every((f) => f.id && typeof f.name === 'string');
+
+  - description: set_custom_fields reports an unknown field without writing
+    vars:
+      tool: set_custom_fields
+      args: { id: '{{ env.REDMINE_EVAL_ISSUE }}', fields: { 'promptfoo no such field': 'x' } }
+    assert:
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          return r.ok === false
+            && r.applied.length === 0
+            && r.unknown_fields?.includes('promptfoo no such field')
+            && Array.isArray(r.available_custom_fields);
+
+  - description: set_custom_fields rejects an empty field map
+    vars:
+      tool: set_custom_fields
+      args: { id: '{{ env.REDMINE_EVAL_ISSUE }}', fields: {} }
+    assert:
+      - type: icontains
+        value: Provide 'fields'
+
+  - description: get_issue on a missing id is an error, not an empty success
+    vars:
+      tool: get_issue
+      args: { id: 999999999 }
+    assert:
+      - type: icontains
+        value: error
