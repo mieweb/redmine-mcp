@@ -31,7 +31,11 @@ defaultTest:
 tests:
   - description: '"how many" is answered from total_count, not the page length'
     vars:
-      prompt: How many tickets are in project sandbox?
+      prompt:
+        - How many tickets are in project sandbox?
+        - What's the ticket count for sandbox?
+        - how many issues does the sandbox project have
+        - Count the bugs/tasks in sandbox.
     assert:
       - type: javascript
         value: (context.metadata?.toolCalls ?? []).some((c) => c.name === 'list_issues')
@@ -40,7 +44,11 @@ tests:
 
   - description: '"created since" maps to created_on'
     vars:
-      prompt: Which tickets were opened in project sandbox since 2026-09-01?
+      prompt:
+        - Which tickets were opened in project sandbox since 2026-09-01?
+        - List sandbox issues created after 2026-09-01.
+        - What new bugs were filed in sandbox since September 1st 2026?
+        - Show tickets reported in sandbox from 2026-09-01 onward.
     assert:
       - type: javascript
         value: |
@@ -49,7 +57,11 @@ tests:
 
   - description: '"updated since" maps to updated_on'
     vars:
-      prompt: Which tickets in project sandbox were modified since 2026-09-01?
+      prompt:
+        - Which tickets in project sandbox were modified since 2026-09-01?
+        - Show sandbox issues updated after 2026-09-01.
+        - What tickets in sandbox have been touched since September 1st 2026?
+        - List sandbox issues with changes since 2026-09-01.
     assert:
       - type: javascript
         value: |
@@ -58,7 +70,11 @@ tests:
 
   - description: '"my tickets" maps to assigned_to_id me'
     vars:
-      prompt: Show my open tickets.
+      prompt:
+        - Show my open tickets.
+        - What am I assigned to?
+        - list issues assigned to me
+        - What's on my plate in Redmine?
     assert:
       - type: javascript
         value: |
