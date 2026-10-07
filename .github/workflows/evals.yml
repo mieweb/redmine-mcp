@@ -1,0 +1,40 @@
+name: LLM evals
+
+# Costs API credits and is non-deterministic, so it is not run on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      redteam:
+        description: Also run the red-team scan
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 6 * * 1'
+  pull_request:
+    types: [labeled]
+
+jobs:
+  evals:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-evals'
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      PROMPTFOO_DISABLE_TELEMETRY: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Tool routing evals
+        run: npx -y promptfoo@0.124.0 eval -c evals/routing.yaml --no-cache -o routing-results.json
+      - name: Red-team scan
+        if: github.event_name == 'schedule' || inputs.redteam
+        run: npm run eval:redteam
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: promptfoo-results
+          path: '*-results.json'
+          if-no-files-found: ignore

@@ -42,6 +42,10 @@ jobs:
             process.exit(ok ? 0 : 1);
           }, 1500);
           EOF
+      - name: Tool contract evals (promptfoo, mock Redmine)
+        env:
+          PROMPTFOO_DISABLE_TELEMETRY: 1
+        run: npm run eval:tools:mock
       - name: Smoke test (stateless MCP 2026-07-28, no handshake, over stdio)
         env:
           REDMINE_URL: https://example.invalid
