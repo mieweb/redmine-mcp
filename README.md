@@ -43,7 +43,7 @@ Ask your editor's AI to *"summarize Redmine #12345"*, *"list my open tickets"*, 
 | `get_time_entry_options` | Valid activities and time-entry custom field values (e.g. Billable Status) for a ticket or project |
 | `create_time_entry` | Log time against an issue or project (activity and custom fields by name) |
 | `list_issue_attachments` | List attachments on an issue (id, filename, content-type, size) |
-| `get_attachment` | Download an attachment by id — **images are returned inline as MCP image content** so the model can view them; other files are returned as base64 and optionally written to disk via `save_to` |
+| `get_attachment` | Download an attachment by id — **images are returned inline as MCP image content** so the model can view them; text files as text; other files as base64. `save_to` also writes them to disk (stdio only) |
 
 ## 🚀 Installation
 
@@ -358,6 +358,11 @@ Once wired up, try asking your AI:
   users from one process: each request acts as the key owner, so no shared admin key
   is needed.
 - Your API key is read from the environment at startup — never hard-code it into a repository.
+- Credentials found in tool results (passwords, API keys, tokens, private keys pasted into
+  tickets or comments) are replaced with `[REDACTED]` before they reach the model.
+- Tools carry MCP `annotations` (`readOnlyHint`, `destructiveHint`) so clients can ask
+  before writes. Local file access (`attach_file` `path`, `get_attachment` `save_to`)
+  is refused in HTTP mode.
 - Rotate the key immediately in Redmine if it is ever exposed.
 - See [SECURITY.md](SECURITY.md) for responsible-disclosure contact info.
 

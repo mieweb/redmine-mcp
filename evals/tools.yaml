@@ -20,14 +20,18 @@ prompts:
   - '{"tool": "{{ tool }}", "args": {{ args | dump | safe }}}'
 
 tests:
-  - description: current_user returns the API key's user
+  - description: current_user returns the API key's user without the key
     vars:
       tool: current_user
       args: {}
     assert:
       - type: is-json
       - type: javascript
-        value: JSON.parse(output).user?.id > 0
+        value: |
+          const u = JSON.parse(output).user;
+          return u?.id > 0 && (u.api_key === undefined || u.api_key === '[REDACTED]');
+      - type: not-contains
+        value: mock-api-key-must-not-leak
 
   - description: list_projects returns a project list
     vars:
@@ -102,6 +106,31 @@ tests:
     assert:
       - type: icontains
         value: Provide 'fields'
+
+  - description: get_issue redacts credentials in the description and comments
+    vars:
+      tool: get_issue
+      args: { id: '{{ env.REDMINE_EVAL_ISSUE }}' }
+    assert:
+      - type: javascript
+        value: JSON.parse(output).issue?.id === Number(process.env.REDMINE_EVAL_ISSUE)
+      - type: not-contains
+        value: hunter2-mock-pw
+      - type: not-contains
+        value: ghp_mockTokenMustNotLeak
+
+  - description: search truncates descriptions and redacts credentials
+    vars:
+      tool: search
+      args: { q: password, issues: 1, limit: 5 }
+    assert:
+      - type: javascript
+        value: |
+          const r = JSON.parse(output);
+          return Array.isArray(r.results)
+            && r.results.every((x) => !x.description || x.description.length <= 301);
+      - type: not-contains
+        value: hunter2-mock-pw
 
   - description: get_issue on a missing id is an error, not an empty success
     vars:

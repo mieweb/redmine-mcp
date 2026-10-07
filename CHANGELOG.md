@@ -36,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   it worked. `create` also returns the new id and a direct url. (#158273)
 
 ### Fixed
+- **Security:** every tool result is scanned for credentials before it reaches the
+  model. Passwords, API keys, tokens, `Bearer`/`Basic` credentials, `user:pass@` in
+  URLs, private keys, and common token formats (GitHub, AWS, Slack, `sk-`) in ticket
+  descriptions, comments, search results, and text attachments become `[REDACTED]`.
+- **Security:** `get_attachment` refuses `save_to` in HTTP mode, so a shared server
+  can no longer be made to write files on its own disk.
+- All tools carry MCP `annotations` (`readOnlyHint`, `destructiveHint`) so clients
+  can ask before writes. Descriptions and server instructions now say ticket text is
+  untrusted and to confirm before closing tickets or overwriting text.
 - **Security:** `current_user` no longer returns the caller's Redmine API key.
 - `add_issue_note` confirmed the wrong (oldest) note on instances that list
   history newest-first; it now picks the newest journal by id.
