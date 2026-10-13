@@ -135,8 +135,9 @@ export function createMockRedmine() {
 				return send(200, { memberships: users.map((u) => ({ user: { id: u.id, name: `${u.firstname} ${u.lastname}` } })) });
 			if (path === "/issues.json") {
 				const limit = Number(url.searchParams.get("limit") || 25);
-				const page = [...issues.values()].slice(0, limit);
-				return send(200, { issues: page, total_count: TOTAL_MATCHES, limit, offset: 0 });
+				const offset = Number(url.searchParams.get("offset") || 0);
+				const page = [...issues.values()].slice(offset, offset + limit);
+				return send(200, { issues: page, total_count: TOTAL_MATCHES, limit, offset });
 			}
 			if (path === "/search.json")
 				return send(200, {
