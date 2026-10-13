@@ -43,6 +43,8 @@ jobs:
           }, 1500);
           EOF
       - name: Tool contract evals (promptfoo, mock Redmine)
+        # promptfoo itself requires Node >= 22.22
+        if: matrix.node-version >= 22
         env:
           PROMPTFOO_DISABLE_TELEMETRY: 1
         run: npm run eval:tools:mock
